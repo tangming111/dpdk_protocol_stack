@@ -18,6 +18,7 @@
 #define ENABLE_TIMER    1
 #define ENABLE_RINGBUFFER 1
 #define ENABLE_MULTHREAD 1
+#define ENABLE_UDP_APP 1
 
 #define ARP_ENTRY_STATUS_DYNAMIC 0
 #define ARP_ENTRY_STATUS_STATIC 1
@@ -347,6 +348,35 @@ print_ether_addr(const char *what, struct rte_ether_addr *eth_addr)
 	printf("%s%s", what, buf);
 }
 
+
+static int udp_process(struct rte_mbuf *udpmbufs)
+{
+    truct rte_ipv4_hdr *ipv4_hdr = rte_pktmbuf_mtod_offset(udpmbufs, struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
+    struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)((unsigned char *)ipv4_hdr + sizeof(struct rte_ipv4_hdr));
+#if ENABLE_SEND
+    rte_memcpy(gDstMac, eth_hdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+
+    rte_memcpy(&gDstIp, &ipv4_hdr->src_addr, sizeof(uint32_t));
+    rte_memcpy(&gSrcIp, &ipv4_hdr->dst_addr, sizeof(uint32_t));
+
+    rte_memcpy(&gDstPort, &udp_hdr->src_port, sizeof(uint16_t));
+    rte_memcpy(&gSrcPort, &udp_hdr->dst_port, sizeof(uint16_t));
+#endif
+                          
+    uint16_t legth = ntohs(udp_hdr->dgram_len);//两个字节以上都转
+    *((char *)udp_hdr + legth) = '\0';
+
+    struct in_addr addr;
+    addr.s_addr = ipv4_hdr->src_addr;
+    printf("Received packet from %s:%d", inet_ntoa(addr), ntohs(udp_hdr->src_port));
+
+    addr.s_addr = ipv4_hdr->dst_addr;
+    printf(" to %s:%d, length:%d ---> %s\n", inet_ntoa(addr), ntohs(udp_hdr->dst_port), legth, (char*)(udp_hdr + 1));
+
+}
+
+
+
 static int pkt_process(void *arg)
 {
 	struct rte_mempool_t *mbuf_pool = (struct rte_mempool *)arg;
@@ -413,33 +443,7 @@ static int pkt_process(void *arg)
             }
             struct rte_ipv4_hdr *ipv4_hdr = rte_pktmbuf_mtod_offset(bufs[i], struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
             if (ipv4_hdr->next_proto_id == IPPROTO_UDP) {
-                struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)((unsigned char *)ipv4_hdr + sizeof(struct rte_ipv4_hdr));
-#if ENABLE_SEND
-                rte_memcpy(gDstMac, eth_hdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
-
-                rte_memcpy(&gDstIp, &ipv4_hdr->src_addr, sizeof(uint32_t));
-                rte_memcpy(&gSrcIp, &ipv4_hdr->dst_addr, sizeof(uint32_t));
-
-                rte_memcpy(&gDstPort, &udp_hdr->src_port, sizeof(uint16_t));
-                rte_memcpy(&gSrcPort, &udp_hdr->dst_port, sizeof(uint16_t));
-#endif
-                          
-                uint16_t legth = ntohs(udp_hdr->dgram_len);//两个字节以上都转
-                *((char *)udp_hdr + legth) = '\0';
-
-                struct in_addr addr;
-                addr.s_addr = ipv4_hdr->src_addr;
-                printf("Received packet from %s:%d", inet_ntoa(addr), ntohs(udp_hdr->src_port));
-
-                addr.s_addr = ipv4_hdr->dst_addr;
-                printf(" to %s:%d, length:%d ---> %s\n", inet_ntoa(addr), ntohs(udp_hdr->dst_port), legth, (char*)(udp_hdr + 1));
-#if ENABLE_SEND
-                struct rte_mbuf *tx_mbuf = ng_send_udp(mbuf_pool, (uint8_t *)(udp_hdr + 1), legth);
-                //rte_eth_tx_burst(gdpdkportid, 0, &tx_mbuf, 1);
-                //rte_pktmbuf_free(tx_mbuf);
-                rte_ring_mp_enqueue_burst(ring->out, (void **)&tx_mbuf, 1, NULL);
-#endif
-                rte_pktmbuf_free(bufs[i]);
+                udp_process(bufs[i]);
             }
 #if ENABLE_ICMP
             if (ipv4_hdr->next_proto_id == IPPROTO_ICMP) {
@@ -464,6 +468,164 @@ static int pkt_process(void *arg)
         }
     }
 }
+
+#if ENABLE_UDP_APP
+
+#define UDP_APP_BUFFER_SIZE 128
+
+struct localhost {
+    int fd;
+    uint32_t local_ip;
+    uint16_t local_port;
+    uint8_t local_mac[RTE_ETHER_ADDR_LEN];
+
+    int protocol; // 0: UDP, 1: TCP
+
+    struct rte_ring *snd_ring;
+    struct rte_ring *rcv_ring;
+
+    struct loaclhost *next;
+    struct loaclhost *prev;
+}
+
+struct localhost *localhost_list = NULL;
+
+#define DEFAULT_FD_NUM 3
+int get_fd_frombitmap(void) {
+    int fd = DEFAULT_FD_NUM;
+    return fd;
+}
+
+
+struct localhost *get_hostinfo_fromfd(int socket_fd) {
+    for (struct localhost *host = localhost_list; host != NULL; host = host->next) {
+        if (host->fd == socket_fd) {
+            return host;
+        }
+    }
+    return NULL;
+}
+
+
+
+int socket(int domain, int type, int protocol) {
+
+    int fd = get_fd_frombitmap();//0,1,2是标准输入输出错误
+
+    struct localhost *host = (struct localhost *)rte_malloc("LOCALHOST", sizeof(struct localhost), 0);
+    if (host == NULL) {
+        rte_exit(EXIT_FAILURE, "Failed to allocate memory for localhost\n");
+        return -1;
+    }
+    memset(host, 0, sizeof(struct localhost));
+    host->fd = fd;
+    if (type == SOCK_DGRAM) {
+        host->protocol = IPPROTO_UDP;
+    } else if (type == SOCK_STREAM) {
+        host->protocol = IPPROTO_TCP;
+    } else {
+        rte_exit(EXIT_FAILURE, "Unsupported socket type\n");
+        return -1;
+    }
+    host->snd_ring = rte_ring_create("SND_RING", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+    if (host->snd_ring == NULL) {
+        rte_free(host);
+        rte_exit(EXIT_FAILURE, "Failed to create send ring\n");
+        return -1;
+    }
+    host->rcv_ring = rte_ring_create("RCV_RING", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+    if (host->rcv_ring == NULL) {
+        rte_ring_free(host->snd_ring);
+        rte_free(host);
+        rte_exit(EXIT_FAILURE, "Failed to create receive ring\n");
+        return -1;
+    }
+    LL_ADD(host, localhost_list);
+
+    return fd;
+}
+
+int bind(int sockfd, const struct sockaddr *addr,
+                socklen_t addrlen) {
+    struct localhost *host = get_hostinfo_fromfd(sockfd);
+    if (host == NULL) {
+        printf("Invalid socket file descriptor\n");
+        return -1;
+    }
+    struct sockaddr_in *local_addr = (struct sockaddr_in *)addr;
+    host->local_port = local_addr->sin_port;
+    rte_memcpy(host->local_ip, local_addr->sin_addr.s_addr, sizeof(uint32_t));
+    rte_memcpy(host->local_mac, gSrcMac, RTE_ETHER_ADDR_LEN);
+
+    return 0;
+}
+
+ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
+                        struct sockaddr *src_addr, socklen_t *addrlen) {
+    struct localhost *host = get_hostinfo_fromfd(sockfd);
+    if (host == NULL) {
+        printf("Invalid socket file descriptor\n");
+        return -1;
+    }
+    
+
+}
+
+ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+                      const struct sockaddr *dest_addr, socklen_t addrlen);
+
+int close(int fd) {
+    struct localhost *host = get_hostinfo_fromfd(fd);
+    if (host == NULL) {
+        printf("Invalid socket file descriptor\n");
+        return -1;
+    }
+    if (host->snd_ring) {
+        rte_ring_free(host->snd_ring);
+    }
+    if (host->rcv_ring) {
+        rte_ring_free(host->rcv_ring);
+    }
+    LL_DEL(host, localhost_list);
+    rte_free(host);
+    return 0;
+}
+
+int udp_server_entry(void *arg) {
+    int connfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (connfd < 0) {
+        printf("socket error\n");
+        return -1;
+    }
+
+    struct sockaddr_in localaddr, clientaddr;
+    memset(&localaddr, 0, sizeof(localaddr));
+
+    localaddr.sin_family = AF_INET;
+    localaddr.sin_addr.s_addr = htonl(INADDR_ANY);//0.0.0.0
+    localaddr.sin_port = htons(8889);
+
+    bind(connfd, (struct sockaddr *)&localaddr, sizeof(localaddr));
+    socklen_t addrlen = sizeof(clientaddr);
+
+    char buffer[UDP_APP_BUFFER_SIZE] = {0};
+    while (1) {
+
+        if (recvfrom(connfd, buffer, UDP_APP_BUFFER_SIZE, 0,
+            (struct sockaddr *)&clientaddr, &addrlen) < 0) {
+            printf("recvfrom error\n");
+            continue;
+        } else {
+            printf("Received UDP packet from %s:%d, data: %s\n",
+                inet_ntoa(clientaddr.sin_addr), ntohs(clientaddr.sin_port), buffer);
+            sendto(connfd, buffer, strlen(buffer), 0,
+                (struct sockaddr *)&clientaddr, sizeof(clientaddr));
+        }
+    }
+    close(connfd);
+}
+
+#endif
 
 int main(int argc, char *argv[])
 {
@@ -509,10 +671,15 @@ int main(int argc, char *argv[])
 #endif
 
 #if ENABLE_MULTHREAD
-    rte_eal_remote_launch(pkt_process, mbuf_pool, rte_get_next_lcore(lcore_id, 1, 0));
+    local_id = rte_get_next_lcore(lcore_id, 1, 0);
+    rte_eal_remote_launch(pkt_process, mbuf_pool, local_id);
 #endif
 
+#if ENABLE_UDP_APP
+    local_id = rte_get_next_lcore(lcore_id, 1, 0);
+    rte_eal_remote_launch(udp_server_entry, NULL, local_id);
 
+#endif
     while(1) {
         //rx
         struct rte_mbuf *rx[BURST_SIZE];
