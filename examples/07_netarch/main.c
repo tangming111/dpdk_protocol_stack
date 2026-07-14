@@ -349,33 +349,66 @@ print_ether_addr(const char *what, struct rte_ether_addr *eth_addr)
 }
 
 
+struct offload {
+    uint32_t src_ip;
+    uint32_t dst_ip;
+
+    uint16_t src_port;
+    uint16_t dst_port;
+
+    uint8_t protocol;
+
+    unsigned char *data;
+    uint16_t data_len;
+}
+
 static int udp_process(struct rte_mbuf *udpmbufs)
 {
     truct rte_ipv4_hdr *ipv4_hdr = rte_pktmbuf_mtod_offset(udpmbufs, struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
     struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)((unsigned char *)ipv4_hdr + sizeof(struct rte_ipv4_hdr));
-#if ENABLE_SEND
-    rte_memcpy(gDstMac, eth_hdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
 
-    rte_memcpy(&gDstIp, &ipv4_hdr->src_addr, sizeof(uint32_t));
-    rte_memcpy(&gSrcIp, &ipv4_hdr->dst_addr, sizeof(uint32_t));
+    struct localhost *host = get_hostinfo_fromip_port(ipv4_hdr->dst_addr, udp_hdr->dst_port, ipv4_hdr->next_proto_id);
+    if (host == NULL) {
+        rte_pktmbuf_free(udpmbufs);
+        return -1;
+    }
 
-    rte_memcpy(&gDstPort, &udp_hdr->src_port, sizeof(uint16_t));
-    rte_memcpy(&gSrcPort, &udp_hdr->dst_port, sizeof(uint16_t));
-#endif
-                          
-    uint16_t legth = ntohs(udp_hdr->dgram_len);//两个字节以上都转
-    *((char *)udp_hdr + legth) = '\0';
+    struct offload *ol = rte_malloc("OFFLOAD", sizeof(struct offload), 0);
+    if (ol == NULL) {
+        rte_pktmbuf_free(udpmbufs);
+        rte_exit(EXIT_FAILURE, "Failed to allocate memory for offload\n");
+        return -1;
+    }
 
-    struct in_addr addr;
-    addr.s_addr = ipv4_hdr->src_addr;
-    printf("Received packet from %s:%d", inet_ntoa(addr), ntohs(udp_hdr->src_port));
+    ol->src_ip = ipv4_hdr->src_addr;
+    ol->dst_ip = ipv4_hdr->dst_addr;
+    ol->src_port = udp_hdr->src_port;
+    ol->dst_port = udp_hdr->dst_port;
+    ol->protocol = IPPROTO_UDP;
+    ol->data_len = ntohs(udp_hdr->dgram_len);
+    ol->data = rte_malloc("UDP_DATA", ol->data_len - sizeof(struct rte_udp_hdr), 0);
+    if (ol->data == NULL) {
+        rte_pktmbuf_free(udpmbufs);
+        rte_free(ol);
+        rte_exit(EXIT_FAILURE, "Failed to allocate memory for UDP data\n");
+        return -1;
+    }
+    // en
 
-    addr.s_addr = ipv4_hdr->dst_addr;
-    printf(" to %s:%d, length:%d ---> %s\n", inet_ntoa(addr), ntohs(udp_hdr->dst_port), legth, (char*)(udp_hdr + 1));
+    rte_ring_mp_enqueue(host->rcv_ring, ol);
+    pthread_mutex_lock(&host->mutex);
+    pthread_cond_signal(&host->cond);
+    pthread_mutex_unlock(&host->mutex);
+
+    rte_pktmbuf_free(udpmbufs);
+    return 0;
 
 }
 
+int udp_out(struct rte_mempool *mbuf_pool)
+{
 
+}
 
 static int pkt_process(void *arg)
 {
@@ -466,6 +499,9 @@ static int pkt_process(void *arg)
             }
 #endif
         }
+#if ENABLE_UDP_APP
+        udp_out(mbuf_pool);
+#endif
     }
 }
 
@@ -475,6 +511,8 @@ static int pkt_process(void *arg)
 
 struct localhost {
     int fd;
+
+    unsigned int status;//阻塞与非阻塞
     uint32_t local_ip;
     uint16_t local_port;
     uint8_t local_mac[RTE_ETHER_ADDR_LEN];
@@ -486,6 +524,9 @@ struct localhost {
 
     struct loaclhost *next;
     struct loaclhost *prev;
+
+    pthread_cond_t cond;
+    pthread_mutex_t mutex;
 }
 
 struct localhost *localhost_list = NULL;
@@ -506,7 +547,14 @@ struct localhost *get_hostinfo_fromfd(int socket_fd) {
     return NULL;
 }
 
-
+struct localhost *get_hostinfo_fromip_port(uint32_t ip, uint16_t port, uint8_t protocol) {
+    for (struct localhost *host = localhost_list; host != NULL; host = host->next) {
+        if (host->local_ip == ip && host->local_port == port && host->protocol == protocol) {
+            return host;
+        }
+    }
+    return NULL;
+}
 
 int socket(int domain, int type, int protocol) {
 
@@ -540,6 +588,12 @@ int socket(int domain, int type, int protocol) {
         rte_exit(EXIT_FAILURE, "Failed to create receive ring\n");
         return -1;
     }
+    pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
+    rte_memcpy(&host->cond, &blank_cond, sizeof(pthread_cond_t));
+
+    pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
+    rte_memcpy(&host->mutex, &blank_mutex, sizeof(pthread_mutex_t));
+
     LL_ADD(host, localhost_list);
 
     return fd;
@@ -567,12 +621,70 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
         printf("Invalid socket file descriptor\n");
         return -1;
     }
-    
+    struct offload *ol = NULL;
+    unsigned char *ptr = NULL;
+    struct sockaddr_in *saddr = (struct sockaddr_in *)src_addr;
+    int nb = -1;
+    pthread_mutex_lock(&host->mutex);
+    while ( nb = rte_ring_mc_dequeue(host->rcv_ring, &ol) < 0) {
+        pthread_cond_wait(&host->cond, &host->mutex);
+    }
+    pthread_mutex_unlock(&host->mutex);
 
+    saddr->sin_port = ol->dst_port;
+    rte_memcpy(&saddr->sin_addr.s_addr, &ol->src_ip, sizeof(uint32_t));
+
+    if (len < ol->data_len) {
+
+        rte_memcpy(buf, ol->data, len);
+
+        ptr = rte_malloc("unsigned char*", ol->length - len, 0);
+        rte_memcpy(ptr, ol->data + len, ol->data_len - len);
+
+        ol->length -= len;
+        rte_free(ol->data);
+        ol->data = ptr;
+
+        rte_ring_mp_enqueue(&host->rcv_ring, ol);
+        return len;
+    } else {
+        rte_memcpy(buf, ol->data, ol->data_len);
+        rte_free(ol->data);
+        rte_free(ol);
+        return ol->data_len;
+    }
 }
 
 ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
-                      const struct sockaddr *dest_addr, socklen_t addrlen);
+                      const struct sockaddr *dest_addr, socklen_t addrlen)
+{
+    struct localhost *host = get_hostinfo_fromfd(sockfd);
+    if (host == NULL) {
+        printf("Invalid socket file descriptor\n");
+        return -1;
+    }
+
+    struct sockaddr_in *daddr = (struct sockaddr_in *)dest_addr;
+    struct offload *ol = rte_malloc("offload", sizeof(struct offload), 0);
+    if (ol == NULL) return -1;
+
+    ol->dst_ip = daddr->sin_addr.s_addr;
+    ol->dst_port = daddr->sin_port;
+    ol->src_ip = host->local_ip;
+    ol->src_port = host->local_port;
+    ol->length = len;
+
+    ol->data = rte_malloc("unsigned char*",len, 0);
+    if (ol->data == NULL) {
+        rte_free(ol);
+        return -1;
+    }
+    rte_memcpy(ol->data, buf, len);
+
+    rte_ring_mp_enqueue(host->snd_ring, ol);
+
+    return len;
+}
 
 int close(int fd) {
     struct localhost *host = get_hostinfo_fromfd(fd);
