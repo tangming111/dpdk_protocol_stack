@@ -28,7 +28,7 @@ struct arp_table_entry {
 
     uint8_t type;//0: dynamic, 1: static
 
-    struct arp_tablke_entry *next;
+    struct arp_table_entry *next;
     struct arp_table_entry *prev;
 };
 
@@ -39,7 +39,7 @@ struct arp_table {
 
 static struct arp_table* arpt = NULL;
 
-static struct arp_table* arp_table_instance() {
+static struct arp_table* arp_table_instance(void) {
     if (arpt == NULL) {
         arpt = (struct arp_table*)rte_malloc("ARP_TABLE", sizeof(struct arp_table), 0);
         if (arpt == NULL) {
@@ -50,16 +50,15 @@ static struct arp_table* arp_table_instance() {
     return arpt;
 }
 
-
-static struct arp_table_entry* ng_get_dst_macaddr(uint32_t ip) {
+static uint8_t* ng_get_dst_macaddr(uint32_t ip) {
     struct arp_table* table = arp_table_instance();
     struct arp_table_entry *entry = table->entries;
 
     while (entry != NULL) {
         if (entry->ip_addr == ip) {
-            return entry;
+            return entry->mac_addr;
         }
-        entry = entry->next;
+        entry = (struct arp_table_entry *)entry->next;
     }
     return NULL;
 }
