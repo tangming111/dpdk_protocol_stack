@@ -180,7 +180,8 @@ static int ng_encode_udp_pkt(uint8_t *msg, uint8_t *data, uint16_t total_len) {
     return 0;
 }
 
-static struct rte_mbuf *ng_send_udp(struct rte_mempool *mempool, uint8_t *data, uint16_t length) {
+static struct rte_mbuf *ng_udp_pkt(struct rte_mempool *mempool, uint32_t sip, uint32_t dip,
+    uint16_t sport, uint16_t dport, uint8_t *srcmac, uint8_t *dstmac, *data, uint16_t length) {
     
     const unsigned total_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + length;//14 + 20 + 8
     struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mempool);
@@ -191,7 +192,8 @@ static struct rte_mbuf *ng_send_udp(struct rte_mempool *mempool, uint8_t *data, 
     mbuf->pkt_len = total_len;
 
     uint8_t *pktdata = rte_pktmbuf_mtod(mbuf, uint8_t *);
-    ng_encode_udp_pkt(pktdata, data, total_len);
+    ng_encode_udp_pkt(pktdata, uint32_t sip, uint32_t dip,
+    uint16_t sport, uint16_t dport, uint8_t *srcmac, uint8_t *dstmac, data, total_len);
 
     return mbuf;
 }
@@ -405,9 +407,76 @@ static int udp_process(struct rte_mbuf *udpmbufs)
 
 }
 
+static int ng_encode_udp_apppkt(uint8_t *msg, uint32_t sip, uint32_t dip,
+    uint16_t sport, uint16_t dport, uint8_t *srcmac, uint8_t *dstmac, uint8_t *data, uint16_t total_len) {
+
+    //ethhdr
+    struct rte_ether_hdr *eth_hdr = (struct rte_ether_hdr *)msg;
+    rte_memcpy(eth_hdr->d_addr.addr_bytes, dstmac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(eth_hdr->s_addr.addr_bytes, srcmac, RTE_ETHER_ADDR_LEN);
+    eth_hdr->ether_type = htons(RTE_ETHER_TYPE_IPV4);
+
+    //iphdr
+    //struct rte_ipv4_hdr *ipv4_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+    struct rte_ipv4_hdr *ipv4_hdr = (struct rte_ipv4_hdr *)(msg + sizeof(struct rte_ether_hdr));
+    ipv4_hdr->version_ihl = 0x45;//版本号是4 长度是5  一个字节没有大小端
+    //ipv4_hdr->version = 0x4;
+    //ipv4_hdr->ihl = 0x5;
+    ipv4_hdr->type_of_service = 0;
+    ipv4_hdr->total_length = htons(total_len - sizeof(struct rte_ether_hdr));
+    ipv4_hdr->packet_id = 0;
+    ipv4_hdr->fragment_offset = 0;
+    ipv4_hdr->time_to_live = 64;
+    ipv4_hdr->next_proto_id = IPPROTO_UDP;
+    ipv4_hdr->src_addr = sip;
+    ipv4_hdr->dst_addr = dip;
+
+    ipv4_hdr->hdr_checksum = 0;//计算校验和前先置0，有脏值
+    ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
+
+    //udphdr
+    //struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)(ipv4_hdr + 1);
+    struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)(msg + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr));
+    udp_hdr->src_port = sport;
+    udp_hdr->dst_port = dport;
+    uint16_t udp_len = total_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr);
+    udp_hdr->dgram_len = htons(udp_len);
+
+    rte_memcpy((uint8_t *)(udp_hdr + 1), data, udp_len);
+    
+    udp_hdr->dgram_cksum = 0;
+    udp_hdr->dgram_cksum = rte_ipv4_udptcp_cksum(ipv4_hdr, udp_hdr);
+
+    return 0;
+}
+
+
 int udp_out(struct rte_mempool *mbuf_pool)
 {
+    struct localhost *host;
+    for (host = lhost; host != NULL; host = host->next) {
 
+        struct offload *ol;
+        int nb_snd = rte_ring_mc_dequeue(host->sndbuf, &ol);
+        if (nb_snd < 0) continue;
+
+        uint8_t *dstmac = ng_get_dst_macaddr(ol->dst_ip);
+        if (dstmac == NULL) {
+            struct rte_mbuf *arp_mbuf = ng_send_arp(mbuf_pool, RTE_ARP_OP_REPLY, gDstMac, ol->src_ip, ol->dst_ip);
+            
+            struct inout_ring *ring = ring_instance();
+            rte_ring_mp_enqueue_burst(ring->out, (void **)&arp_mbuf, 1, NULL);
+
+            rte_ring_mp_enqueue(host->snd_ring, ol);
+        } else {
+            struct rte_mbuf *udpbuf = ng_udp_pkt(mbuf_pool, ol->src_ip, ol->src_port, ol->dst_port, dstmac, ol->data, ol->data_len);
+
+            struct inout_ring *ring = ring_instance();
+            rte_ring_mp_enqueue_burst(ring->out, (void **)&udpbuf, 1, NULL);
+        }
+    }
+
+    return 0;    
 }
 
 static int pkt_process(void *arg)
