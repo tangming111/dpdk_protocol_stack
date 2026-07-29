@@ -361,7 +361,7 @@ arp_request_timer_cb(__attribute__((unused)) struct rte_timer *tim,
     int i = 1;
     for (i = 1; i <= 254; i++) {
         //uint32_t target_ip = MAKE_IPV4_ADDR(192, 168, 196, i);
-        uint32_t target_ip = (glocalIp & 0xFFFFFF00) | ((i << 24) & 0xFF000000);
+        uint32_t target_ip = (glocalIp & 0x00FFFFFF) | ((i << 24) & 0xFF000000);
         uint8_t* dst_mac = ng_get_dst_macaddr(target_ip);
         struct in_addr addr;
         addr.s_addr = target_ip;
@@ -435,7 +435,7 @@ static int udp_process(struct rte_mbuf *udpmbufs)
         return -1;
     }
     // en
-
+    rte_memcpy(ol->data, (unsigned char*)(udp_hdr + 1), ol->data_len - sizeof(struct rte_udp_hdr));
     rte_ring_mp_enqueue(host->rcv_ring, (void*)ol);
     pthread_mutex_lock(&host->mutex);
     pthread_cond_signal(&host->cond);
@@ -724,7 +724,7 @@ ssize_t nrecvfrom(int sockfd, void *buf, size_t len, int flags,
     }
     pthread_mutex_unlock(&host->mutex);
 
-    saddr->sin_port = ol->dst_port;
+    saddr->sin_port = ol->src_port;
     rte_memcpy(&saddr->sin_addr.s_addr, &ol->src_ip, sizeof(uint32_t));
 
     if (len < ol->data_len) {
