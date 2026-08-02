@@ -182,7 +182,7 @@ static int ng_encode_arp_pkt(uint8_t *msg, uint8_t *dst_mac, uint32_t src_ip, ui
         uint8_t mac[RTE_ETHER_ADDR_LEN] = {0x0};
         rte_memcpy(eth_hdr->d_addr.addr_bytes, mac, RTE_ETHER_ADDR_LEN);
     }
-    //rte_memcpy(eth_hdr->s_addr.addr_bytes, gSrcMac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(eth_hdr->s_addr.addr_bytes, gSrcMac, RTE_ETHER_ADDR_LEN);
     eth_hdr->ether_type = htons(RTE_ETHER_TYPE_ARP);
 
     //arphdr
@@ -194,8 +194,10 @@ static int ng_encode_arp_pkt(uint8_t *msg, uint8_t *dst_mac, uint32_t src_ip, ui
     arp_hdr->arp_opcode = htons(opcode);
     rte_memcpy(arp_hdr->arp_data.arp_sha.addr_bytes, gSrcMac, RTE_ETHER_ADDR_LEN);
     rte_memcpy(arp_hdr->arp_data.arp_tha.addr_bytes, dst_mac, RTE_ETHER_ADDR_LEN);
-    arp_hdr->arp_data.arp_sip = dst_ip;
-    arp_hdr->arp_data.arp_tip = src_ip;
+    //arp_hdr->arp_data.arp_sip = dst_ip;
+    //arp_hdr->arp_data.arp_tip = src_ip;
+    arp_hdr->arp_data.arp_tip = dst_ip;
+    arp_hdr->arp_data.arp_sip = src_ip;
 
     return 0;
 }
@@ -306,9 +308,9 @@ arp_request_timer_cb(__attribute__((unused)) struct rte_timer *tim,
         if (dst_mac == NULL) {
             //arphdr --> mac: FF:FF:FF:FF:FF:FF
             //ether  --> mac: 00:00:00:00:00:00
-            arp_mbuf = ng_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST, gDefaultArpMac, glocalIp, target_ip);
+            arp_mbuf = ng_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST, gDefaultArpMac, htonl(glocalIp), htonl(target_ip));
         } else {
-            arp_mbuf = ng_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST, dst_mac, glocalIp, target_ip);
+            arp_mbuf = ng_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST, dst_mac, htonl(glocalIp), htonl(target_ip));
         }
         //rte_eth_tx_burst(gdpdkportid, 0, &arp_mbuf, 1);
         //rte_pktmbuf_free(arp_mbuf);
@@ -345,6 +347,7 @@ static int udp_process(struct rte_mbuf *udpmbufs)
     struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)((unsigned char *)ipv4_hdr + sizeof(struct rte_ipv4_hdr));
 
     struct localhost *host = get_hostinfo_fromip_port(ipv4_hdr->dst_addr, udp_hdr->dst_port, ipv4_hdr->next_proto_id);
+    printf("udp_process host: %p\n", (void*)host);
     if (host == NULL) {
         rte_pktmbuf_free(udpmbufs);
         return -1;
@@ -372,11 +375,11 @@ static int udp_process(struct rte_mbuf *udpmbufs)
     }
     // en
     rte_memcpy(ol->data, (unsigned char*)(udp_hdr + 1), ol->data_len - sizeof(struct rte_udp_hdr));
-    rte_ring_mp_enqueue(host->rcv_ring, (void*)ol);
+    rte_ring_sp_enqueue(host->rcv_ring, (void*)ol);
     pthread_mutex_lock(&host->mutex);
     pthread_cond_signal(&host->cond);
     pthread_mutex_unlock(&host->mutex);
-
+    printf("udp_process ---> src: %s:%d \n", inet_ntoa(*(struct in_addr *)&ol->src_ip), ntohs(ol->src_port));
     rte_pktmbuf_free(udpmbufs);
     return 0;
 
@@ -417,7 +420,8 @@ static int ng_encode_udp_apppkt(uint8_t *msg, uint32_t sip, uint32_t dip,
     uint16_t udp_len = total_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr);
     udp_hdr->dgram_len = htons(udp_len);
 
-    rte_memcpy((uint8_t *)(udp_hdr + 1), data, udp_len);
+    //rte_memcpy((uint8_t *)(udp_hdr + 1), data, udp_len);
+    rte_memcpy((uint8_t *)(udp_hdr + 1), data, udp_len - sizeof(struct rte_udp_hdr));
     
     udp_hdr->dgram_cksum = 0;
     udp_hdr->dgram_cksum = rte_ipv4_udptcp_cksum(ipv4_hdr, udp_hdr);
@@ -432,7 +436,7 @@ int udp_out(struct rte_mempool *mbuf_pool)
     for (host = localhost_list; host != NULL; host = host->next) {
 
         struct offload *ol;
-        int nb_snd = rte_ring_mc_dequeue(host->snd_ring, (void**)&ol);
+        int nb_snd = rte_ring_sc_dequeue(host->snd_ring, (void**)&ol);
         if (nb_snd < 0) continue;
 
         struct in_addr addr;
@@ -446,7 +450,7 @@ int udp_out(struct rte_mempool *mbuf_pool)
             struct inout_ring *ring = ring_instance();
             rte_ring_mp_enqueue_burst(ring->out, (void **)&arp_mbuf, 1, NULL);
 
-            rte_ring_mp_enqueue(host->snd_ring, (void*)ol);
+            rte_ring_sp_enqueue(host->snd_ring, (void*)ol);
         } else {
             struct rte_mbuf *udpbuf = ng_udp_pkt(mbuf_pool, ol->src_ip, ol->dst_ip, ol->src_port, ol->dst_port, host->local_mac, dstmac, ol->data, ol->data_len);
 
@@ -487,7 +491,7 @@ static int pkt_process(void *arg)
                 if (arp_hdr->arp_data.arp_tip == glocalIp) {
                     if(arp_hdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
                         printf("arp --> request\n");
-                        struct rte_mbuf *arp_mbuf = ng_send_arp(mbuf_pool, RTE_ARP_OP_REPLY, arp_hdr->arp_data.arp_sha.addr_bytes, arp_hdr->arp_data.arp_sip, arp_hdr->arp_data.arp_tip);
+                        struct rte_mbuf *arp_mbuf = ng_send_arp(mbuf_pool, RTE_ARP_OP_REPLY, arp_hdr->arp_data.arp_sha.addr_bytes, arp_hdr->arp_data.arp_tip, arp_hdr->arp_data.arp_sip);
                         //rte_eth_tx_burst(gdpdkportid, 0, &arp_mbuf, 1);
                         //rte_pktmbuf_free(arp_mbuf);
                         rte_ring_mp_enqueue_burst(ring->out, (void **)&arp_mbuf, 1, NULL);
@@ -523,11 +527,12 @@ static int pkt_process(void *arg)
 #endif
 
             if (eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
-                //rte_pktmbuf_free(bufs[i]);
+                rte_pktmbuf_free(bufs[i]);
                 continue;
             }
             struct rte_ipv4_hdr *ipv4_hdr = rte_pktmbuf_mtod_offset(bufs[i], struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
             if (ipv4_hdr->next_proto_id == IPPROTO_UDP) {
+                printf("udp packet received\n");
                 udp_process(bufs[i]);
             }
 #if ENABLE_ICMP
@@ -584,6 +589,7 @@ struct localhost *get_hostinfo_fromfd(int socket_fd) {
 
 struct localhost *get_hostinfo_fromip_port(uint32_t ip, uint16_t port, uint8_t protocol) {
     for (struct localhost *host = localhost_list; host != NULL; host = host->next) {
+        printf("get_hostinfo_fromip_port ---> ip: %s: port %d protocol: %d\n", inet_ntoa(*(struct in_addr *)&host->local_ip), ntohs(host->local_port), host->protocol);
         if (host->local_ip == ip && host->local_port == port && host->protocol == protocol) {
             return host;
         }
@@ -664,7 +670,7 @@ ssize_t nrecvfrom(int sockfd, void *buf, size_t len,__attribute__((unused)) int 
     struct sockaddr_in *saddr = (struct sockaddr_in *)src_addr;
     int nb = -1;
     pthread_mutex_lock(&host->mutex);
-    while ( (nb = rte_ring_mc_dequeue(host->rcv_ring, (void**)&ol)) < 0) {
+    while ( (nb = rte_ring_sc_dequeue(host->rcv_ring, (void**)&ol)) < 0) {
         pthread_cond_wait(&host->cond, &host->mutex);
     }
     pthread_mutex_unlock(&host->mutex);
@@ -683,7 +689,7 @@ ssize_t nrecvfrom(int sockfd, void *buf, size_t len,__attribute__((unused)) int 
         rte_free(ol->data);
         ol->data = ptr;
 
-        rte_ring_mp_enqueue(host->rcv_ring, (void*)ol);
+        rte_ring_sp_enqueue(host->rcv_ring, (void*)ol);
         return len;
     } else {
         rte_memcpy(buf, ol->data, ol->data_len);
@@ -724,7 +730,7 @@ ssize_t nsendto(int sockfd, const void *buf, size_t len, __attribute__((unused))
     }
     rte_memcpy(ol->data, buf, len);
 
-    rte_ring_mp_enqueue(host->snd_ring, (void*)ol);
+    rte_ring_sp_enqueue(host->snd_ring, (void*)ol);
 
     return len;
 }
@@ -797,7 +803,8 @@ int main(int argc, char *argv[])
     ng_init_port(mbuf_pool);
 
     rte_eth_macaddr_get(gdpdkportid, (struct rte_ether_addr*)&gSrcMac);
-#ifdef ENABLE_TIMER
+
+#if ENABLE_TIMER
 
     /* init RTE timer library */
 	rte_timer_subsystem_init();
@@ -811,7 +818,7 @@ int main(int argc, char *argv[])
 
 #endif
 
-#ifdef ENABLE_RINGBUFFER
+#if ENABLE_RINGBUFFER
 
     struct inout_ring *ring = ring_instance();
     if(ring == NULL) {
@@ -826,16 +833,15 @@ int main(int argc, char *argv[])
 
 #endif
 
-#if ENABLE_MULTHREAD
-    int local_id;
-    local_id = rte_get_next_lcore(lcore_id, 1, 0);
-    rte_eal_remote_launch(pkt_process, mbuf_pool, local_id);
+#if ENABLE_UDP_APP
+    lcore_id = rte_get_next_lcore(lcore_id, 1, 0);
+    rte_eal_remote_launch(udp_server_entry, NULL, lcore_id);
+
 #endif
 
-#if ENABLE_UDP_APP
-    local_id = rte_get_next_lcore(lcore_id, 1, 0);
-    rte_eal_remote_launch(udp_server_entry, NULL, local_id);
-
+#if ENABLE_MULTHREAD
+    lcore_id = rte_get_next_lcore(lcore_id, 1, 0);
+    rte_eal_remote_launch(pkt_process, mbuf_pool, lcore_id);
 #endif
     while(1) {
         //rx
