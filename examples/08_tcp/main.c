@@ -27,12 +27,11 @@
 
 #define NUM_MBUFS (4096 - 1)
 #define BURST_SIZE 128
-
+#define MAX_FD_COUNT	1024
 
 #define MAKE_IPV4_ADDR(a, b, c, d) \
     ((uint32_t)(((a) & 0xff)) | (((b) & 0xff) << 8) | (((c) & 0xff) << 16) | (((d) & 0xff) << 24))
 static const uint32_t glocalIp = MAKE_IPV4_ADDR(192, 168, 196, 132);
-
 
 #define TIMER_RESOLUTION_CYCLES 2000000000ULL /* around 10ms  at 2 Ghz   10ms * 100 */
 #define RING_SIZE 1024
@@ -59,15 +58,15 @@ static uint8_t gSrcMac[RTE_ETHER_ADDR_LEN];
 struct localhost {
     int fd;
 
-    unsigned int status;//阻塞与非阻塞
+    //unsigned int status;//阻塞与非阻塞
     uint32_t local_ip;
-    uint16_t local_port;
     uint8_t local_mac[RTE_ETHER_ADDR_LEN];
+    uint16_t local_port;
 
     int protocol; // 0: UDP, 1: TCP
 
-    struct rte_ring *snd_ring;
-    struct rte_ring *rcv_ring;
+    struct rte_ring *sndbuf;
+    struct rte_ring *rcvbuf;
 
     struct localhost *next;
     struct localhost *prev;
@@ -111,8 +110,8 @@ static int ng_encode_udp_apppkt(uint8_t *msg, uint32_t sip, uint32_t dip,
     uint16_t sport, uint16_t dport, uint8_t *srcmac, uint8_t *dstmac, uint8_t *data, uint16_t total_len);
 static int udp_out(struct rte_mempool *mbuf_pool);
 static int get_fd_frombitmap(void);
-static struct localhost *get_hostinfo_fromfd(int socket_fd);
-int nclose(int fd);
+void* get_hostinfo_fromfd(int socket_fd);
+static int nclose(int fd);
 int udp_server_entry(void *arg);
 static int nsocket(int domain, int type, int protocol);
 static int nbind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
@@ -120,12 +119,14 @@ ssize_t nrecvfrom(int sockfd, void *buf, size_t len, int flags,
                   struct sockaddr *src_addr, socklen_t *addrlen);
 ssize_t nsendto(int sockfd, const void *buf, size_t len, int flags,
                 const struct sockaddr *dest_addr, socklen_t addrlen);
+static int nlisten(int sockfd, __attribute__((unused)) int backlog);
 
 #if ENABLE_TCP_APP
-
+static int naccept(int sockfd, struct sockaddr *addr, __attribute__((unused)) socklen_t *addrlen);
 static int ng_tcp_process(struct rte_mbuf *tcpmbuf);
 static int ng_tcp_out(struct rte_mempool *mbuf_pool);
-
+static ssize_t nsend(int sockfd, const void *buf, size_t len,__attribute__((unused)) int flags);
+static ssize_t nrecv(int sockfd, void *buf, size_t len, __attribute__((unused)) int flags);
 
 #endif
 
@@ -394,7 +395,7 @@ static int udp_process(struct rte_mbuf *udpmbufs)
     }
     // en
     rte_memcpy(ol->data, (unsigned char*)(udp_hdr + 1), ol->data_len - sizeof(struct rte_udp_hdr));
-    rte_ring_sp_enqueue(host->rcv_ring, (void*)ol);
+    rte_ring_sp_enqueue(host->rcvbuf, (void*)ol);
     pthread_mutex_lock(&host->mutex);
     pthread_cond_signal(&host->cond);
     pthread_mutex_unlock(&host->mutex);
@@ -455,7 +456,7 @@ int udp_out(struct rte_mempool *mbuf_pool)
     for (host = localhost_list; host != NULL; host = host->next) {
 
         struct offload *ol;
-        int nb_snd = rte_ring_sc_dequeue(host->snd_ring, (void**)&ol);
+        int nb_snd = rte_ring_sc_dequeue(host->sndbuf, (void**)&ol);
         if (nb_snd < 0) continue;
 
         struct in_addr addr;
@@ -469,7 +470,7 @@ int udp_out(struct rte_mempool *mbuf_pool)
             struct inout_ring *ring = ring_instance();
             rte_ring_mp_enqueue_burst(ring->out, (void **)&arp_mbuf, 1, NULL);
 
-            rte_ring_sp_enqueue(host->snd_ring, (void*)ol);
+            rte_ring_sp_enqueue(host->sndbuf, (void*)ol);
         } else {
             struct rte_mbuf *udpbuf = ng_udp_pkt(mbuf_pool, ol->src_ip, ol->dst_ip, ol->src_port, ol->dst_port, host->local_mac, dstmac, ol->data, ol->data_len);
 
@@ -514,15 +515,14 @@ struct ng_tcp_stream { // tcb control block
 
 	int fd; //
 
-	uint32_t sip;
 	uint32_t dip;
-
-	uint16_t sport;
+    uint8_t localmac[RTE_ETHER_ADDR_LEN];
 	uint16_t dport;
 
-	uint16_t proto;
+	uint16_t protocol;
 
-	uint8_t localmac[RTE_ETHER_ADDR_LEN];
+    uint16_t sport;
+    uint32_t sip;
 
 	uint32_t snd_nxt; // seqnum
 	uint32_t rcv_nxt; // acknum
@@ -534,6 +534,9 @@ struct ng_tcp_stream { // tcb control block
 
 	struct ng_tcp_stream *prev;
 	struct ng_tcp_stream *next;
+
+    pthread_cond_t cond;
+	pthread_mutex_t mutex;
 
 };
 
@@ -577,7 +580,7 @@ static struct ng_tcp_table *tcpInstance(void) {
 }
 
 
-static struct ng_tcp_stream * ng_tcp_stream_search(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) { // proto
+static struct ng_tcp_stream * ng_tcp_stream_search(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) { // protocol
 
 	struct ng_tcp_table *table = tcpInstance();
 
@@ -594,7 +597,7 @@ static struct ng_tcp_stream * ng_tcp_stream_search(uint32_t sip, uint32_t dip, u
 	return NULL;
 }
 
-static struct ng_tcp_stream * ng_tcp_stream_create(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) { // proto
+static struct ng_tcp_stream * ng_tcp_stream_create(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) { // protocol
 
 	// tcp --> status
 	struct ng_tcp_stream *stream = rte_malloc("ng_tcp_stream", sizeof(struct ng_tcp_stream), 0);
@@ -604,7 +607,7 @@ static struct ng_tcp_stream * ng_tcp_stream_create(uint32_t sip, uint32_t dip, u
 	stream->dip = dip;
 	stream->sport = sport;
 	stream->dport = dport;
-	stream->proto = IPPROTO_TCP;
+	stream->protocol = IPPROTO_TCP;
 
 	// 
 	stream->status = NG_TCP_STATUS_LISTEN;
@@ -699,9 +702,89 @@ static int ng_tcp_handle_syn_rcvd(struct ng_tcp_stream *stream, struct rte_tcp_h
 
 			stream->status = NG_TCP_STATUS_ESTABLISHED;
 
+			// accept
+			struct ng_tcp_stream *listener = ng_tcp_stream_search(0, 0, 0, stream->dport);
+			if (listener == NULL) {
+				rte_exit(EXIT_FAILURE, "ng_tcp_stream_search failed\n");
+			}
+
+			pthread_mutex_lock(&listener->mutex);
+			pthread_cond_signal(&listener->cond);
+			pthread_mutex_unlock(&listener->mutex);
+			
+
 		}
 
 	}
+	return 0;
+}
+
+static int ng_tcp_enqueue_recvbuffer(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, int tcplen) {
+
+	// recv buffer
+	struct ng_tcp_fragment *rfragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+	if (rfragment == NULL) return -1;
+	memset(rfragment, 0, sizeof(struct ng_tcp_fragment));
+
+	rfragment->dport = ntohs(tcphdr->dst_port);
+	rfragment->sport = ntohs(tcphdr->src_port);
+
+	uint8_t hdrlen = tcphdr->data_off >> 4;
+	int payloadlen = tcplen - hdrlen * 4; //
+	if (payloadlen > 0) {
+		
+		uint8_t *payload = (uint8_t*)tcphdr + hdrlen * 4;
+
+		rfragment->data = rte_malloc("unsigned char *", payloadlen+1, 0);
+		if (rfragment->data == NULL) {
+			rte_free(rfragment);
+			return -1;
+		}
+		memset(rfragment->data, 0, payloadlen+1);
+
+		rte_memcpy(rfragment->data, payload, payloadlen);
+		rfragment->length = payloadlen;
+
+	} else if (payloadlen == 0) {
+
+		rfragment->length = 0;
+		rfragment->data = NULL;
+
+	}
+	rte_ring_mp_enqueue(stream->rcvbuf, rfragment);
+
+	pthread_mutex_lock(&stream->mutex);
+	pthread_cond_signal(&stream->cond);
+	pthread_mutex_unlock(&stream->mutex);
+
+	return 0;
+}
+
+static int ng_tcp_send_ackpkt(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr) {
+
+	struct ng_tcp_fragment *ackfrag = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+	if (ackfrag == NULL) return -1;
+	memset(ackfrag, 0, sizeof(struct ng_tcp_fragment));
+
+	ackfrag->dport = tcphdr->src_port;
+	ackfrag->sport = tcphdr->dst_port;
+
+	// remote
+	
+	printf("ng_tcp_send_ackpkt: %d, %d\n", stream->rcv_nxt, ntohs(tcphdr->sent_seq));
+	
+
+	ackfrag->acknum = stream->rcv_nxt;
+	ackfrag->seqnum = stream->snd_nxt;
+
+	ackfrag->tcp_flags = RTE_TCP_ACK_FLAG;
+	ackfrag->windows = TCP_INITIAL_WINDOW;
+	ackfrag->hdrlen_off = 0x50;
+	ackfrag->data = NULL;
+	ackfrag->length = 0;
+	
+	rte_ring_mp_enqueue(stream->sndbuf, ackfrag);
+
 	return 0;
 }
 
@@ -710,9 +793,10 @@ static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tc
 	if (tcphdr->tcp_flags & RTE_TCP_SYN_FLAG) {
 		//
 	} 
-	if (tcphdr->tcp_flags & RTE_TCP_PSH_FLAG) {
+	if (tcphdr->tcp_flags & RTE_TCP_PSH_FLAG) { //
 
 		// recv buffer
+#if 0
 		struct ng_tcp_fragment *rfragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
 		if (rfragment == NULL) return -1;
 		memset(rfragment, 0, sizeof(struct ng_tcp_fragment));
@@ -739,7 +823,14 @@ static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tc
 			printf("tcp : %s\n", rfragment->data);
 		}
 		rte_ring_mp_enqueue(stream->rcvbuf, rfragment);
+#else
 
+		ng_tcp_enqueue_recvbuffer(stream, tcphdr, tcplen);
+
+#endif
+
+
+#if 0
 		// ack pkt
 		struct ng_tcp_fragment *ackfrag = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
 		if (ackfrag == NULL) return -1;
@@ -769,7 +860,19 @@ static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tc
 		
 		rte_ring_mp_enqueue(stream->sndbuf, ackfrag);
 
+#else
+
+		uint8_t hdrlen = tcphdr->data_off >> 4;
+		int payloadlen = tcplen - hdrlen * 4;
+		
+		stream->rcv_nxt = stream->rcv_nxt + payloadlen;
+		stream->snd_nxt = ntohl(tcphdr->recv_ack);
+		
+		ng_tcp_send_ackpkt(stream, tcphdr);
+		
+#endif
 		// echo pkt
+#if 0
 		struct ng_tcp_fragment *echofrag = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
 		if (echofrag == NULL) return -1;
 		memset(echofrag, 0, sizeof(struct ng_tcp_fragment));
@@ -797,7 +900,8 @@ static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tc
 		echofrag->length = payloadlen;
 
 		rte_ring_mp_enqueue(stream->sndbuf, echofrag);
-		
+#endif
+
 	}
 	if (tcphdr->tcp_flags & RTE_TCP_ACK_FLAG) {
 
@@ -805,6 +909,75 @@ static int ng_tcp_handle_established(struct ng_tcp_stream *stream, struct rte_tc
 	if (tcphdr->tcp_flags & RTE_TCP_FIN_FLAG) {
 
 		stream->status = NG_TCP_STATUS_CLOSE_WAIT;
+
+#if 0
+
+		struct ng_tcp_fragment *rfragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+		if (rfragment == NULL) return -1;
+		memset(rfragment, 0, sizeof(struct ng_tcp_fragment));
+
+		rfragment->dport = ntohs(tcphdr->dst_port);
+		rfragment->sport = ntohs(tcphdr->src_port);
+
+		uint8_t hdrlen = tcphdr->data_off >> 4;
+		int payloadlen = tcplen - hdrlen * 4;
+
+		rfragment->length = 0;
+		rfragment->data = NULL;
+		
+		rte_ring_mp_enqueue(stream->rcvbuf, rfragment);
+		
+#else
+
+		ng_tcp_enqueue_recvbuffer(stream, tcphdr, tcphdr->data_off >> 4);
+
+#endif
+		// send ack ptk
+		stream->rcv_nxt = stream->rcv_nxt + 1;
+		stream->snd_nxt = ntohl(tcphdr->recv_ack);
+		
+		ng_tcp_send_ackpkt(stream, tcphdr);
+
+	}
+
+	return 0;
+}
+
+static int ng_tcp_handle_close_wait(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr) {
+
+	if (tcphdr->tcp_flags & RTE_TCP_FIN_FLAG) { //
+
+		if (stream->status == NG_TCP_STATUS_CLOSE_WAIT) {
+
+			
+
+		}
+
+	}
+
+	
+	return 0;
+
+}
+
+static int ng_tcp_handle_last_ack(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr) {
+
+	if (tcphdr->tcp_flags & RTE_TCP_ACK_FLAG) {
+
+		if (stream->status == NG_TCP_STATUS_LAST_ACK) {
+
+			stream->status = NG_TCP_STATUS_CLOSED;
+
+			printf("ng_tcp_handle_last_ack\n");
+			struct ng_tcp_table *table = tcpInstance();
+			LL_REMOVE(stream, table->tcb_set);
+
+			rte_ring_free(stream->sndbuf);
+			rte_ring_free(stream->rcvbuf);
+
+			rte_free(stream);
+
+		}
 
 	}
 
@@ -878,9 +1051,11 @@ static int ng_tcp_process(struct rte_mbuf *tcpmbuf) {
 			break;
 
 		case NG_TCP_STATUS_CLOSE_WAIT: // ~server
+			ng_tcp_handle_close_wait(stream, tcphdr);
 			break;
 			
 		case NG_TCP_STATUS_LAST_ACK:  // ~server
+			ng_tcp_handle_last_ack(stream, tcphdr);
 			break;
 
 	}
@@ -1011,7 +1186,52 @@ static int ng_tcp_out(struct rte_mempool *mbuf_pool) {
 	return 0;
 }
 
+#define BUFFER_SIZE	1024
+// hook
+static int tcp_server_entry(__attribute__((unused))  void *arg)  {
 
+	int listenfd = nsocket(AF_INET, SOCK_STREAM, 0);
+	if (listenfd == -1) {
+		return -1;
+	}
+
+	struct sockaddr_in servaddr;
+	memset(&servaddr, 0, sizeof(struct sockaddr));
+	servaddr.sin_family = AF_INET;
+	servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+	servaddr.sin_port = htons(9999);
+	nbind(listenfd, (struct sockaddr*)&servaddr, sizeof(servaddr));
+
+	nlisten(listenfd, 10);
+
+	while (1) {
+		
+		struct sockaddr_in client;
+		socklen_t len = sizeof(client);
+		int connfd = naccept(listenfd, (struct sockaddr*)&client, &len);
+
+		char buff[BUFFER_SIZE] = {0};
+		while (1) {
+
+			int n = nrecv(connfd, buff, BUFFER_SIZE, 0); //block
+			if (n > 0) {
+				printf("recv: %s\n", buff);
+				nsend(connfd, buff, n, 0);
+
+			} else if (n == 0) {
+
+				nclose(connfd);
+				break;
+			} else { //nonblock
+
+			}
+		}
+
+	}
+	nclose(listenfd);
+	
+
+}
 
 #endif
 
@@ -1139,23 +1359,69 @@ static int pkt_process(void *arg)
 
 #define DEFAULT_FD_NUM 3
 
+static unsigned char fd_table[MAX_FD_COUNT] = {0};
+
 static int get_fd_frombitmap(void) {
-    int fd = DEFAULT_FD_NUM;
-    return fd;
+
+	int fd = DEFAULT_FD_NUM;
+	for ( ;fd < MAX_FD_COUNT;fd ++) {
+		if ((fd_table[fd/8] & (0x1 << (fd % 8))) == 0) {
+			fd_table[fd/8] |= (0x1 << (fd % 8));
+			return fd;
+		}
+	}
+
+	return -1;
+	
 }
 
+static int set_fd_frombitmap(int fd) {
 
-struct localhost *get_hostinfo_fromfd(int socket_fd) {
-    for (struct localhost *host = localhost_list; host != NULL; host = host->next) {
+	if (fd >= MAX_FD_COUNT) return -1;
+
+	fd_table[fd/8] &= ~(0x1 << (fd % 8));
+
+	return 0;
+}
+
+static struct ng_tcp_stream *get_accept_tcb(uint16_t dport) {
+
+	struct ng_tcp_stream *apt;
+	struct ng_tcp_table *table = tcpInstance();
+	for (apt = table->tcb_set;apt != NULL;apt = apt->next) {
+		if (dport == apt->dport && apt->fd == -1) {
+			return apt;
+		}
+	}
+
+	return NULL;
+}
+
+void* get_hostinfo_fromfd(int socket_fd) {
+    
+    struct localhost *host;
+
+    for (host = localhost_list; host != NULL; host = host->next) {
         if (host->fd == socket_fd) {
             return host;
         }
     }
+
+    struct ng_tcp_stream *stream;
+
+	struct ng_tcp_table *table = tcpInstance();
+	for (stream = table->tcb_set;stream != NULL;stream = stream->next) {
+		if (socket_fd == stream->fd) {
+			return stream;
+		}
+	}
+
     return NULL;
 }
 
 struct localhost *get_hostinfo_fromip_port(uint32_t ip, uint16_t port, uint8_t protocol) {
-    for (struct localhost *host = localhost_list; host != NULL; host = host->next) {
+    struct localhost *host;
+    for (host = localhost_list; host != NULL; host = host->next) {
         printf("get_hostinfo_fromip_port ---> ip: %s: port %d protocol: %d\n", inet_ntoa(*(struct in_addr *)&host->local_ip), ntohs(host->local_port), host->protocol);
         if (host->local_ip == ip && host->local_port == port && host->protocol == protocol) {
             return host;
@@ -1184,15 +1450,15 @@ static int nsocket(int domain, int type, int protocol) {
         rte_exit(EXIT_FAILURE, "Unsupported nsocket type\n");
         return -1;
     }
-    host->snd_ring = rte_ring_create("SND_RING", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
-    if (host->snd_ring == NULL) {
+    host->sndbuf = rte_ring_create("SND_RING", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+    if (host->sndbuf == NULL) {
         rte_free(host);
         rte_exit(EXIT_FAILURE, "Failed to create send ring\n");
         return -1;
     }
-    host->rcv_ring = rte_ring_create("RCV_RING", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
-    if (host->rcv_ring == NULL) {
-        rte_ring_free(host->snd_ring);
+    host->rcvbuf = rte_ring_create("RCV_RING", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+    if (host->rcvbuf == NULL) {
+        rte_ring_free(host->sndbuf);
         rte_free(host);
         rte_exit(EXIT_FAILURE, "Failed to create receive ring\n");
         return -1;
@@ -1209,25 +1475,183 @@ static int nsocket(int domain, int type, int protocol) {
 }
 
 static int nbind(int sockfd, const struct sockaddr *addr,
-                socklen_t addrlen) {
-    (void)addrlen;
+                __attribute__((unused))socklen_t addrlen) {
     struct localhost *host = get_hostinfo_fromfd(sockfd);
     if (host == NULL) {
         printf("Invalid nsocket file descriptor\n");
         return -1;
     }
-    const struct sockaddr_in *local_addr = (const struct sockaddr_in *)addr;
-    host->local_port = local_addr->sin_port;
-    host->local_ip = local_addr->sin_addr.s_addr;
-    rte_memcpy(host->local_mac, gSrcMac, RTE_ETHER_ADDR_LEN);
+    if ( host->protocol == IPPROTO_UDP) {
+        const struct sockaddr_in *local_addr = (const struct sockaddr_in *)addr;
+        host->local_port = local_addr->sin_port;
+        host->local_ip = local_addr->sin_addr.s_addr;
+        rte_memcpy(host->local_mac, gSrcMac, RTE_ETHER_ADDR_LEN);
+
+    } else if (host->protocol == IPPROTO_TCP) {
+        struct ng_tcp_stream *stream = (struct ng_tcp_stream *)host;
+        const struct sockaddr_in *laddr = (const struct sockaddr_in *)addr;
+		stream->dport = laddr->sin_port;
+		rte_memcpy(&stream->dip, &laddr->sin_addr.s_addr, sizeof(uint32_t));
+		rte_memcpy(stream->localmac, gSrcMac, RTE_ETHER_ADDR_LEN);
+
+		stream->status = NG_TCP_STATUS_CLOSED;
+    }
 
     return 0;
+}
+
+static int nlisten(int sockfd, __attribute__((unused)) int backlog) { //
+
+	void *hostinfo =  get_hostinfo_fromfd(sockfd);
+	if (hostinfo == NULL) return -1;
+
+	
+	struct ng_tcp_stream *stream = (struct ng_tcp_stream *)hostinfo;
+	if (stream->protocol == IPPROTO_TCP) {
+		stream->status = NG_TCP_STATUS_LISTEN;
+	}
+
+	return 0;
+}
+
+static int naccept(int sockfd, struct sockaddr *addr, __attribute__((unused)) socklen_t *addrlen) {
+
+	void *hostinfo =  get_hostinfo_fromfd(sockfd);
+	if (hostinfo == NULL) return -1;
+
+	struct ng_tcp_stream *stream = (struct ng_tcp_stream *)hostinfo;
+	if (stream->protocol == IPPROTO_TCP) {
+
+		struct ng_tcp_stream *apt = NULL;
+
+		pthread_mutex_lock(&stream->mutex);
+		while((apt = get_accept_tcb(stream->dport)) == NULL) {
+			pthread_cond_wait(&stream->cond, &stream->mutex);
+		} 
+		pthread_mutex_unlock(&stream->mutex);
+
+		apt->fd = get_fd_frombitmap();
+
+		struct sockaddr_in *saddr = (struct sockaddr_in *)addr;
+		saddr->sin_port = apt->sport;
+		rte_memcpy(&saddr->sin_addr.s_addr, &apt->sip, sizeof(uint32_t));
+
+		return apt->fd;
+	}
+
+	return -1;
+}
+
+static ssize_t nsend(int sockfd, const void *buf, size_t len,__attribute__((unused)) int flags) {
+
+	ssize_t length = 0;
+
+	void *hostinfo =  get_hostinfo_fromfd(sockfd);
+	if (hostinfo == NULL) return -1;
+
+	struct ng_tcp_stream *stream = (struct ng_tcp_stream *)hostinfo;
+	if (stream->protocol == IPPROTO_TCP) {
+
+		struct ng_tcp_fragment *fragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+		if (fragment == NULL) {
+			return -2;
+		}
+
+		memset(fragment, 0, sizeof(struct ng_tcp_fragment));
+
+		fragment->dport = stream->sport;
+		fragment->sport = stream->dport;
+
+		fragment->acknum = stream->rcv_nxt;
+		fragment->seqnum = stream->snd_nxt;
+
+		fragment->tcp_flags = RTE_TCP_ACK_FLAG | RTE_TCP_PSH_FLAG;
+		fragment->windows = TCP_INITIAL_WINDOW;
+		fragment->hdrlen_off = 0x50;
+
+
+		fragment->data = rte_malloc("unsigned char *", len+1, 0);
+		if (fragment->data == NULL) {
+			rte_free(fragment);
+			return -1;
+		}
+		memset(fragment->data, 0, len+1);
+
+		rte_memcpy(fragment->data, buf, len);
+		fragment->length = len;
+		length = fragment->length;
+
+		// int nb_snd = 0;
+		rte_ring_mp_enqueue(stream->sndbuf, fragment);
+
+	}
+
+	
+	return length;
+}
+
+// recv 32
+// recv 
+static ssize_t nrecv(int sockfd, void *buf, size_t len, __attribute__((unused)) int flags) {
+	
+	ssize_t length = 0;
+
+	void *hostinfo =  get_hostinfo_fromfd(sockfd);
+	if (hostinfo == NULL) return -1;
+
+	struct ng_tcp_stream *stream = (struct ng_tcp_stream *)hostinfo;
+	if (stream->protocol == IPPROTO_TCP) {
+
+		struct ng_tcp_fragment *fragment = NULL;
+		int nb_rcv = 0;
+
+		printf("rte_ring_mc_dequeue before\n");
+		pthread_mutex_lock(&stream->mutex);
+		while ((nb_rcv = rte_ring_mc_dequeue(stream->rcvbuf, (void **)&fragment)) < 0) {
+			pthread_cond_wait(&stream->cond, &stream->mutex);
+		}
+		pthread_mutex_unlock(&stream->mutex);
+		printf("rte_ring_mc_dequeue after\n");
+
+		if (fragment->length > (int)len) {
+
+			rte_memcpy(buf, fragment->data, len);
+
+			uint32_t i = 0;
+			for(i = 0;i < fragment->length-len;i ++) {
+				fragment->data[i] = fragment->data[len+i];
+			}
+			fragment->length = fragment->length-len;
+			length = fragment->length;
+
+			rte_ring_mp_enqueue(stream->rcvbuf, fragment);
+
+		} else if (fragment->length == 0) {
+
+			rte_free(fragment);
+			return 0;
+		
+		} else {
+
+			rte_memcpy(buf, fragment->data, fragment->length);
+			length = fragment->length;
+
+			rte_free(fragment->data);
+			fragment->data = NULL;
+
+			rte_free(fragment);
+			
+		}
+
+	}
+
+	return length;
 }
 
 ssize_t nrecvfrom(int sockfd, void *buf, size_t len,__attribute__((unused)) int flags,
                         struct sockaddr *src_addr,__attribute__((unused)) socklen_t *addrlen) {
 
-    struct localhost *host = get_hostinfo_fromfd(sockfd);
+    struct localhost *host = (struct localhost *)get_hostinfo_fromfd(sockfd);
     if (host == NULL) {
         printf("Invalid nsocket file descriptor\n");
         return -1;
@@ -1237,7 +1661,7 @@ ssize_t nrecvfrom(int sockfd, void *buf, size_t len,__attribute__((unused)) int 
     struct sockaddr_in *saddr = (struct sockaddr_in *)src_addr;
     int nb = -1;
     pthread_mutex_lock(&host->mutex);
-    while ( (nb = rte_ring_sc_dequeue(host->rcv_ring, (void**)&ol)) < 0) {
+    while ( (nb = rte_ring_sc_dequeue(host->rcvbuf, (void**)&ol)) < 0) {
         pthread_cond_wait(&host->cond, &host->mutex);
     }
     pthread_mutex_unlock(&host->mutex);
@@ -1256,7 +1680,7 @@ ssize_t nrecvfrom(int sockfd, void *buf, size_t len,__attribute__((unused)) int 
         rte_free(ol->data);
         ol->data = ptr;
 
-        rte_ring_sp_enqueue(host->rcv_ring, (void*)ol);
+        rte_ring_sp_enqueue(host->rcvbuf, (void*)ol);
         return len;
     } else {
         rte_memcpy(buf, ol->data, ol->data_len);
@@ -1270,7 +1694,7 @@ ssize_t nsendto(int sockfd, const void *buf, size_t len, __attribute__((unused))
                       const struct sockaddr *dest_addr, __attribute__((unused)) socklen_t addrlen)
 {
 
-    struct localhost *host = get_hostinfo_fromfd(sockfd);
+    struct localhost *host = (struct localhost *)get_hostinfo_fromfd(sockfd);
     if (host == NULL) {
         printf("Invalid nsocket file descriptor\n");
         return -1;
@@ -1297,26 +1721,72 @@ ssize_t nsendto(int sockfd, const void *buf, size_t len, __attribute__((unused))
     }
     rte_memcpy(ol->data, buf, len);
 
-    rte_ring_sp_enqueue(host->snd_ring, (void*)ol);
+    rte_ring_sp_enqueue(host->sndbuf, (void*)ol);
 
     return len;
 }
 
-int nclose(int fd) {
-    struct localhost *host = get_hostinfo_fromfd(fd);
-    if (host == NULL) {
-        printf("Invalid nsocket file descriptor\n");
-        return -1;
-    }
-    if (host->snd_ring) {
-        rte_ring_free(host->snd_ring);
-    }
-    if (host->rcv_ring) {
-        rte_ring_free(host->rcv_ring);
-    }
-    LL_REMOVE(host, localhost_list);
-    rte_free(host);
-    return 0;
+static int nclose(int fd) {
+
+	
+	void *hostinfo =  get_hostinfo_fromfd(fd);
+	if (hostinfo == NULL) return -1;
+
+	struct localhost *host = (struct localhost*)hostinfo;
+	if (host->protocol == IPPROTO_UDP) {
+
+		LL_REMOVE(host, localhost_list);
+
+		if (host->rcvbuf) {
+			rte_ring_free(host->rcvbuf);
+		}
+		if (host->sndbuf) {
+			rte_ring_free(host->sndbuf);
+		}
+
+		rte_free(host);
+
+		set_fd_frombitmap(fd);
+		
+	} else if (host->protocol == IPPROTO_TCP) { 
+
+		struct ng_tcp_stream *stream = (struct ng_tcp_stream*)hostinfo;
+
+		if (stream->status != NG_TCP_STATUS_LISTEN) {
+			
+			struct ng_tcp_fragment *fragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
+			if (fragment == NULL) return -1;
+
+			printf("nclose --> enter last ack\n");
+			fragment->data = NULL;
+			fragment->length = 0;
+			fragment->sport = stream->dport;
+			fragment->dport = stream->sport;
+
+			fragment->seqnum = stream->snd_nxt;
+			fragment->acknum = stream->rcv_nxt;
+
+			fragment->tcp_flags = RTE_TCP_FIN_FLAG | RTE_TCP_ACK_FLAG;
+			fragment->windows = TCP_INITIAL_WINDOW;
+			fragment->hdrlen_off = 0x50;
+
+			rte_ring_mp_enqueue(stream->sndbuf, fragment);
+			stream->status = NG_TCP_STATUS_LAST_ACK;
+
+			
+			set_fd_frombitmap(fd);
+
+		} else { // nsocket
+
+			struct ng_tcp_table *table = tcpInstance();
+			LL_REMOVE(stream, table->tcb_set);	
+
+			rte_free(stream);
+
+		}
+	}
+
+	return 0;
 }
 
 int udp_server_entry(__attribute__((unused)) void *arg) {
@@ -1403,6 +1873,12 @@ int main(int argc, char *argv[])
 #if ENABLE_UDP_APP
     lcore_id = rte_get_next_lcore(lcore_id, 1, 0);
     rte_eal_remote_launch(udp_server_entry, NULL, lcore_id);
+
+#endif
+
+#if ENABLE_TCP_APP
+    lcore_id = rte_get_next_lcore(lcore_id, 1, 0);
+    rte_eal_remote_launch(tcp_server_entry, NULL, lcore_id);
 
 #endif
 
