@@ -597,7 +597,7 @@ static struct ng_tcp_stream * ng_tcp_stream_search(uint32_t sip, uint32_t dip, u
 	return NULL;
 }
 
-static struct ng_tcp_stream * ng_tcp_stream_create(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) { // protocol
+static struct ng_tcp_stream * ng_tcp_stream_create(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) { // proto
 
 	// tcp --> status
 	struct ng_tcp_stream *stream = rte_malloc("ng_tcp_stream", sizeof(struct ng_tcp_stream), 0);
@@ -608,35 +608,41 @@ static struct ng_tcp_stream * ng_tcp_stream_create(uint32_t sip, uint32_t dip, u
 	stream->sport = sport;
 	stream->dport = dport;
 	stream->protocol = IPPROTO_TCP;
+	stream->fd = -1; //unused
 
 	// 
 	stream->status = NG_TCP_STATUS_LISTEN;
 
-	//stream->sndbuf = rte_ring_create("sndbuf", RING_SIZE, rte_socket_id(), 0);
-	//stream->rcvbuf = rte_ring_create("rcvbuf", RING_SIZE, rte_socket_id(), 0);
+	printf("ng_tcp_stream_create\n");
+	//
+	static uint32_t stream_cnt = 0;
+	char sndname[32], rcvname[32];
+	snprintf(sndname, sizeof(sndname), "sndbuf_%u", stream_cnt);
+	snprintf(rcvname, sizeof(rcvname), "rcvbuf_%u", stream_cnt);
+	stream_cnt++;
 
-    // ring name must be <= 28 chars: rte_ring_create() prepends "RG_" and
-    // rejects names where "RG_" + name >= RTE_MEMZONE_NAMESIZE (32).
-    // "sndbuf_%x_%x_%x_%x" is 34 chars -> always fails with ENAMETOOLONG.
-    char snd_name[64], rcv_name[64];
-    static uint32_t tcp_ring_seq = 0;
-    uint32_t seq = __sync_fetch_and_add(&tcp_ring_seq, 1);
-    snprintf(snd_name, sizeof(snd_name), "snd_%u", seq);
-    snprintf(rcv_name, sizeof(rcv_name), "rcv_%u", seq);
-    stream->sndbuf = rte_ring_create(snd_name, RING_SIZE, rte_socket_id(), 0);
-    stream->rcvbuf = rte_ring_create(rcv_name, RING_SIZE, rte_socket_id(), 0);
+	stream->sndbuf = rte_ring_create(sndname, RING_SIZE, rte_socket_id(), 0);
+	if (stream->sndbuf == NULL) {
+		rte_free(stream);
+		return NULL;
+	}
+	stream->rcvbuf = rte_ring_create(rcvname, RING_SIZE, rte_socket_id(), 0);
+	if (stream->rcvbuf == NULL) {
+		rte_ring_free(stream->sndbuf);
+		rte_free(stream);
+		return NULL;
+	}
 	
-    if (stream->sndbuf == NULL || stream->rcvbuf == NULL) {
-        if (stream->sndbuf) rte_ring_free(stream->sndbuf);
-        if (stream->rcvbuf) rte_ring_free(stream->rcvbuf);
-        rte_free(stream);
-        return NULL;
-    }
 	// seq num
 	uint32_t next_seed = time(NULL);
 	stream->snd_nxt = rand_r(&next_seed) % TCP_MAX_SEQ;
-
 	rte_memcpy(stream->localmac, gSrcMac, RTE_ETHER_ADDR_LEN);
+
+	pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
+	rte_memcpy(&stream->cond, &blank_cond, sizeof(pthread_cond_t));
+
+	pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
+	rte_memcpy(&stream->mutex, &blank_mutex, sizeof(pthread_mutex_t));
 
 	struct ng_tcp_table *table = tcpInstance();
 	LL_ADD(stream, table->tcb_set);
@@ -1199,7 +1205,7 @@ static int tcp_server_entry(__attribute__((unused))  void *arg)  {
 	memset(&servaddr, 0, sizeof(struct sockaddr));
 	servaddr.sin_family = AF_INET;
 	servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-	servaddr.sin_port = htons(9999);
+	servaddr.sin_port = htons(8889);
 	nbind(listenfd, (struct sockaddr*)&servaddr, sizeof(servaddr));
 
 	nlisten(listenfd, 10);
@@ -1430,48 +1436,97 @@ struct localhost *get_hostinfo_fromip_port(uint32_t ip, uint16_t port, uint8_t p
     return NULL;
 }
 
-static int nsocket(int domain, int type, int protocol) {
-    (void)domain;
-    (void)protocol;
-    int fd = get_fd_frombitmap();//0,1,2是标准输入输出错误
+static int nsocket(__attribute__((unused)) int domain, int type, __attribute__((unused))  int protocol) {
 
-    struct localhost *host = (struct localhost *)rte_malloc("LOCALHOST", sizeof(struct localhost), 0);
-    if (host == NULL) {
-        rte_exit(EXIT_FAILURE, "Failed to allocate memory for localhost\n");
-        return -1;
-    }
-    memset(host, 0, sizeof(struct localhost));
-    host->fd = fd;
-    if (type == SOCK_DGRAM) {
-        host->protocol = IPPROTO_UDP;
-    } else if (type == SOCK_STREAM) {
-        host->protocol = IPPROTO_TCP;
-    } else {
-        rte_exit(EXIT_FAILURE, "Unsupported nsocket type\n");
-        return -1;
-    }
-    host->sndbuf = rte_ring_create("SND_RING", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
-    if (host->sndbuf == NULL) {
-        rte_free(host);
-        rte_exit(EXIT_FAILURE, "Failed to create send ring\n");
-        return -1;
-    }
-    host->rcvbuf = rte_ring_create("RCV_RING", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
-    if (host->rcvbuf == NULL) {
-        rte_ring_free(host->sndbuf);
-        rte_free(host);
-        rte_exit(EXIT_FAILURE, "Failed to create receive ring\n");
-        return -1;
-    }
-    pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
-    rte_memcpy(&host->cond, &blank_cond, sizeof(pthread_cond_t));
+	int fd = get_fd_frombitmap(); //
 
-    pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
-    rte_memcpy(&host->mutex, &blank_mutex, sizeof(pthread_mutex_t));
+	if (type == SOCK_DGRAM) {
 
-    LL_ADD(host, localhost_list);
+		struct localhost *host = rte_malloc("localhost", sizeof(struct localhost), 0);
+		if (host == NULL) {
+			return -1;
+		}
+		memset(host, 0, sizeof(struct localhost));
 
-    return fd;
+		host->fd = fd;
+		
+		host->protocol = IPPROTO_UDP;
+
+		char rcvname[32], sndname[32];
+		snprintf(rcvname, sizeof(rcvname), "recv buffer %d", fd);
+		snprintf(sndname, sizeof(sndname), "send buffer %d", fd);
+
+		host->rcvbuf = rte_ring_create(rcvname, RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+		if (host->rcvbuf == NULL) {
+
+			rte_free(host);
+			return -1;
+		}
+
+	
+		host->sndbuf = rte_ring_create(sndname, RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+		if (host->sndbuf == NULL) {
+
+			rte_ring_free(host->rcvbuf);
+
+			rte_free(host);
+			return -1;
+		}
+
+		pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
+		rte_memcpy(&host->cond, &blank_cond, sizeof(pthread_cond_t));
+
+		pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
+		rte_memcpy(&host->mutex, &blank_mutex, sizeof(pthread_mutex_t));
+
+		LL_ADD(host, localhost_list);
+		
+	} else if (type == SOCK_STREAM) {
+
+
+		struct ng_tcp_stream *stream = rte_malloc("ng_tcp_stream", sizeof(struct ng_tcp_stream), 0);
+		if (stream == NULL) {
+			return -1;
+		}
+		memset(stream, 0, sizeof(struct ng_tcp_stream));
+
+		stream->fd = fd;
+		stream->protocol = IPPROTO_TCP;
+		stream->next = stream->prev = NULL;
+
+		char rcvname[32], sndname[32];
+		snprintf(rcvname, sizeof(rcvname), "tcp recv buffer %d", fd);
+		snprintf(sndname, sizeof(sndname), "tcp send buffer %d", fd);
+
+		stream->rcvbuf = rte_ring_create(rcvname, RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+		if (stream->rcvbuf == NULL) {
+
+			rte_free(stream);
+			return -1;
+		}
+
+	
+		stream->sndbuf = rte_ring_create(sndname, RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+		if (stream->sndbuf == NULL) {
+
+			rte_ring_free(stream->rcvbuf);
+
+			rte_free(stream);
+			return -1;
+		}
+
+		pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
+		rte_memcpy(&stream->cond, &blank_cond, sizeof(pthread_cond_t));
+
+		pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
+		rte_memcpy(&stream->mutex, &blank_mutex, sizeof(pthread_mutex_t));
+
+		struct ng_tcp_table *table = tcpInstance();
+		LL_ADD(stream, table->tcb_set);
+		// get_stream_from_fd();
+	}
+
+	return fd;
 }
 
 static int nbind(int sockfd, const struct sockaddr *addr,
