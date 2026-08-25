@@ -580,15 +580,23 @@ static struct ng_tcp_table *tcpInstance(void) {
 }
 
 
-static struct ng_tcp_stream * ng_tcp_stream_search(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) { // protocol
+static struct ng_tcp_stream * ng_tcp_stream_search(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) { // proto
 
 	struct ng_tcp_table *table = tcpInstance();
 
 	struct ng_tcp_stream *iter;
-	for (iter = table->tcb_set;iter != NULL; iter = iter->next) {
+	for (iter = table->tcb_set;iter != NULL; iter = iter->next) { // established
 
 		if (iter->sip == sip && iter->dip == dip && 
 			iter->sport == sport && iter->dport == dport) {
+			return iter;
+		}
+
+	}
+
+	for (iter = table->tcb_set;iter != NULL; iter = iter->next) {
+
+		if (iter->dport == dport && iter->status == NG_TCP_STATUS_LISTEN) { // listen
 			return iter;
 		}
 
@@ -644,19 +652,23 @@ static struct ng_tcp_stream * ng_tcp_stream_create(uint32_t sip, uint32_t dip, u
 	pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
 	rte_memcpy(&stream->mutex, &blank_mutex, sizeof(pthread_mutex_t));
 
-	struct ng_tcp_table *table = tcpInstance();
-	LL_ADD(stream, table->tcb_set);
+	//struct ng_tcp_table *table = tcpInstance();
+	//LL_ADD(stream, table->tcb_set);
 
 	return stream;
 }
 
 
 
-static int ng_tcp_handle_listen(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr) {
+static int ng_tcp_handle_listen(struct ng_tcp_stream *stream, struct rte_tcp_hdr *tcphdr,struct rte_ipv4_hdr *iphdr) {
     printf("ng_tcp_handle_listen: %d, %d\n", stream->rcv_nxt, ntohs(tcphdr->sent_seq));
 	if (tcphdr->tcp_flags & RTE_TCP_SYN_FLAG)  {
 
 		if (stream->status == NG_TCP_STATUS_LISTEN) {
+
+            struct ng_tcp_table *table = tcpInstance();
+			struct ng_tcp_stream *syn = ng_tcp_stream_create(iphdr->src_addr, iphdr->dst_addr, tcphdr->src_port, tcphdr->dst_port);
+			LL_ADD(syn, table->tcb_set);
 
 			struct ng_tcp_fragment *fragment = rte_malloc("ng_tcp_fragment", sizeof(struct ng_tcp_fragment), 0);
 			if (fragment == NULL) return -1;
@@ -666,16 +678,16 @@ static int ng_tcp_handle_listen(struct ng_tcp_stream *stream, struct rte_tcp_hdr
 			fragment->dport = tcphdr->src_port;
 
 			struct in_addr addr;
-			addr.s_addr = stream->sip;
+			addr.s_addr = syn->sip;
 			printf("tcp ---> src: %s:%d ", inet_ntoa(addr), ntohs(tcphdr->src_port));
 
 			
-			addr.s_addr = stream->dip;
+			addr.s_addr = syn->dip;
 			printf("  ---> dst: %s:%d \n", inet_ntoa(addr), ntohs(tcphdr->dst_port));
 
-			fragment->seqnum = stream->snd_nxt;
+			fragment->seqnum = syn->snd_nxt;
 			fragment->acknum = ntohl(tcphdr->sent_seq) + 1;
-			stream->rcv_nxt = fragment->acknum;
+			syn->rcv_nxt = fragment->acknum;
 			
 			fragment->tcp_flags = (RTE_TCP_SYN_FLAG | RTE_TCP_ACK_FLAG);
 			fragment->windows = TCP_INITIAL_WINDOW;
@@ -684,9 +696,9 @@ static int ng_tcp_handle_listen(struct ng_tcp_stream *stream, struct rte_tcp_hdr
 			fragment->data = NULL;
 			fragment->length = 0;
 
-			rte_ring_mp_enqueue(stream->sndbuf, fragment);
+			rte_ring_mp_enqueue(syn->sndbuf, fragment);
 			
-			stream->status = NG_TCP_STATUS_SYN_RCVD;
+			syn->status = NG_TCP_STATUS_SYN_RCVD;
 		}
 
 	}
@@ -1028,7 +1040,7 @@ static int ng_tcp_process(struct rte_mbuf *tcpmbuf) {
 			break;
 			
 		case NG_TCP_STATUS_LISTEN: // server
-			ng_tcp_handle_listen(stream, tcphdr);
+			ng_tcp_handle_listen(stream, tcphdr, iphdr);
 			break;
 
 		case NG_TCP_STATUS_SYN_RCVD: // server  
@@ -1153,11 +1165,13 @@ static struct rte_mbuf * ng_tcp_pkt(struct rte_mempool *mbuf_pool, uint32_t sip,
 // struct localhost , struct tcp_stream
 
 static int ng_tcp_out(struct rte_mempool *mbuf_pool) {
-    printf("ng_tcp_out ---> \n");
+
 	struct ng_tcp_table *table = tcpInstance();
 	
 	struct ng_tcp_stream *stream;
 	for (stream = table->tcb_set;stream != NULL;stream = stream->next) {
+
+        if (stream->sndbuf == NULL) continue; // listener
 
 		struct ng_tcp_fragment *fragment = NULL;
 		int nb_snd = rte_ring_mc_dequeue(stream->sndbuf, (void**)&fragment);
