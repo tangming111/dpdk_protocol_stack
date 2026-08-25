@@ -328,9 +328,9 @@ arp_request_timer_cb(__attribute__((unused)) struct rte_timer *tim,
         if (dst_mac == NULL) {
             //arphdr --> mac: FF:FF:FF:FF:FF:FF
             //ether  --> mac: 00:00:00:00:00:00
-            arp_mbuf = ng_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST, gDefaultArpMac, htonl(glocalIp), target_ip);
+            arp_mbuf = ng_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST, gDefaultArpMac, glocalIp, target_ip);
         } else {
-            arp_mbuf = ng_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST, dst_mac, htonl(glocalIp), htonl(target_ip));
+            arp_mbuf = ng_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST, dst_mac, glocalIp, target_ip);
         }
         //rte_eth_tx_burst(gdpdkportid, 0, &arp_mbuf, 1);
         //rte_pktmbuf_free(arp_mbuf);
