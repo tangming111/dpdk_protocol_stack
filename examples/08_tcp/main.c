@@ -1753,9 +1753,10 @@ ssize_t nrecvfrom(int sockfd, void *buf, size_t len,__attribute__((unused)) int 
         return len;
     } else {
         rte_memcpy(buf, ol->data, ol->data_len);
+        int length = ol->data_len;
         rte_free(ol->data);
         rte_free(ol);
-        return ol->data_len;
+        return length;
     }
 }
 

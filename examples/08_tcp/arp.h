@@ -54,13 +54,15 @@ static uint8_t* ng_get_dst_macaddr(uint32_t ip) {
     struct arp_table* table = arp_table_instance();
     struct arp_table_entry *entry = table->entries;
 
-    while (entry != NULL) {
-        if (entry->ip_addr == ip) {
-            return entry->mac_addr;
-        }
-        entry = (struct arp_table_entry *)entry->next;
-    }
-    return NULL;
+    int count = table->count;
+	
+	for (iter = table->entries; count-- != 0 && iter != NULL;iter = iter->next) {
+		if (ip == iter->ip_addr) {
+			return iter->mac_addr;
+		}
+	}
+
+	return NULL;
 }
 
 
