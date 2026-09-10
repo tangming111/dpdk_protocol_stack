@@ -9,7 +9,7 @@
 #include <rte_malloc.h>
 #include <rte_timer.h>
 #include <rte_kni.h>
-
+#include <math.h>
 #include "arp.h"
 
 #define ENABLE_SEND 1
@@ -23,6 +23,7 @@
 #define ENABLE_UDP_APP 1
 #define ENABLE_TCP_APP 1
 #define ENABLE_KNI_APP 1
+#define ENABLE_DDOS_DETECT	1
 
 #define ARP_ENTRY_STATUS_DYNAMIC 0
 #define ARP_ENTRY_STATUS_STATIC 1
@@ -1919,6 +1920,162 @@ static struct rte_kni *ng_alloc_kni(struct rte_mempool *mbuf_pool) {
 
 #endif
 
+#if ENABLE_DDOS_DETECT
+
+
+#define CAPTURE_WINDOWS		256
+
+static double tresh = 1200.0;
+
+static uint32_t p_setbits[CAPTURE_WINDOWS] = {0};
+static uint32_t p_totbits[CAPTURE_WINDOWS] = {0};
+static double p_entropy[CAPTURE_WINDOWS] = {0};
+static int pkt_idx = 0;
+
+/*
+ 23651/17408, E(nan)
+ 1805328/4456448 Entropy(nan), Total_Entropy(4339971.575790)
+ 
+  23526/17408, E(nan)
+ 1805203/4456448 Entropy(nan), Total_Entropy(4339902.272671)
+ 
+  17847/17408, E(nan)
+ 1799524/4456448 Entropy(nan), Total_Entropy(4336731.547140)
+ 
+  17670/17408, E(nan)
+ 1799347/4456448 Entropy(nan), Total_Entropy(4336632.027009)
+ 
+  17774/17408, E(nan)
+ 1799451/4456448 Entropy(nan), Total_Entropy(4336690.507219)
+
+ */
+static double ddos_entropy(double set_bits, double total_bits) {
+
+	return ( - set_bits) * (log2(set_bits) - log2(total_bits)) // 1 
+	- (total_bits - set_bits) * (log2(total_bits - set_bits) - log2(total_bits))
+	+ log2(total_bits);
+
+}
+
+
+static uint32_t count_bit(uint8_t *msg, const uint32_t length) {
+	
+#if 0
+	uint32_t v; // count bits set in this (32-bit value)
+	uint32_t c, set_bits = 0; // store the total here
+	static const int S[5] = {1, 2, 4, 8, 16}; // Magic Binary Numbers
+	static const int B[5] = {0x55555555, 0x33333333, 0x0F0F0F0F, 0x00FF00FF, 0x0000FFFF};
+
+
+	uint32_t *ptr = (uint32_t *)msg;
+	uint32_t *end = (uint32_t *)msg + length;
+
+	
+
+	while (ptr < end) {
+
+		v = *ptr++;
+		
+		c = v - ((v >> S[0]) & B[0]);
+		c = ((c >> S[1]) & B[1]) + (c & B[1]);
+		c = ((c >> S[2]) + c) & B[2];
+		c = ((c >> S[3]) + c) & B[3];
+		c = ((c >> S[4]) + c) & B[4];
+
+		set_bits += c;
+	}
+#else
+
+	uint64_t v, set_bits = 0;
+   	const uint64_t *ptr = (uint64_t *) msg;
+   	const uint64_t *end = (uint64_t *) (msg + length);
+   	
+	do {
+      v = *(ptr++);
+      v = v - ((v >> 1) & 0x5555555555555555);                    // reuse input as temporary
+      v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333);     // temp
+      v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0F;
+      set_bits += (v * 0x0101010101010101) >> (sizeof(v) - 1) * 8; // count
+
+    } while(end > ptr);
+
+#endif
+	return set_bits;
+	
+}
+
+
+
+static int ddos_detect(struct rte_mbuf *pkt) {
+
+	static char flag = 0; // 1 ddos, 0 no attack
+
+	uint8_t *msg = rte_pktmbuf_mtod(pkt, uint8_t * );
+	uint32_t set_bits = count_bit(msg, pkt->buf_len);
+
+	uint32_t tot_bits = pkt->buf_len * 8;
+
+	p_setbits[pkt_idx % CAPTURE_WINDOWS] = set_bits;
+	p_totbits[pkt_idx % CAPTURE_WINDOWS] = tot_bits;
+	p_entropy[pkt_idx % CAPTURE_WINDOWS] = ddos_entropy(set_bits, tot_bits);
+
+	//printf("\n %u/%u, E(%f)\n", set_bits, tot_bits, p_entropy[pkt_idx % CAPTURE_WINDOWS]);
+	if (pkt_idx >= CAPTURE_WINDOWS) {
+
+		int i = 0;
+		uint32_t total_set = 0, total_bit = 0;
+		double sum_entropy = 0.0;
+		
+		for (i = 0;i < CAPTURE_WINDOWS;i ++) {
+			total_set += p_setbits[i]; // set_bits
+			total_bit += p_totbits[i]; // count_bits
+			sum_entropy += p_entropy[i];
+		}
+
+		double entropy = ddos_entropy(total_set, total_bit);
+
+	// nan -->  
+		printf("%u/%u Entropy(%f), Total_Entropy(%f)\n", total_set, total_bit, sum_entropy, entropy);
+		if (tresh <  sum_entropy - entropy) { // ddos attack
+
+			if (!flag) { // detect
+				// 
+				rte_exit(EXIT_FAILURE, "ddos attack !!! Entropy(%f) < Total_Entropy(%f)\n", 
+					entropy, sum_entropy);
+
+			}
+
+			flag = 1;
+
+		} else {
+
+			if (flag) { //
+				
+				printf( "no new !!! Entropy(%f) < Total_Entropy(%f)\n", 
+					entropy, sum_entropy);
+			}
+
+			flag = 0;
+
+		}
+		
+		// sum(p_entropy[i])
+		// ddos_entropy(sum(set_bits), sum(tot_bits));
+
+		pkt_idx = (pkt_idx+1) % CAPTURE_WINDOWS + CAPTURE_WINDOWS;
+	} else {
+		pkt_idx ++;
+	}
+	
+
+	return 0;
+	
+}
+
+
+
+#endif
+
 int main(int argc, char *argv[])
 {
     if(rte_eal_init(argc, argv) < 0) {
@@ -1998,6 +2155,13 @@ int main(int argc, char *argv[])
         if (num_recv > BURST_SIZE) {
             rte_exit(EXIT_FAILURE, "Error receiving from ethdev\n");
         } else if (num_recv > 0) {
+#if ENABLE_DDOS_DETECT
+		
+			unsigned i = 0;
+			for (i = 0;i < num_recvd;i ++) {
+				ddos_detect(rx[i]);
+			}
+#endif
             rte_ring_sp_enqueue_burst(ring->in, (void **)rx, num_recv, NULL);//入队
         }
         //tx 
