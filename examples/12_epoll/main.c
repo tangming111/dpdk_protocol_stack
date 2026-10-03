@@ -858,9 +858,9 @@ static int ng_tcp_handle_syn_rcvd(struct ng_tcp_stream *stream, struct rte_tcp_h
 			}
 
 			pthread_mutex_lock(&listener->mutex);
-			pthread_cond_signal(&listener->cond);//唤醒naccept
+			pthread_cond_signal(&listener->cond);//唤醒naccept  epoll中冗余了1、顺序反了 2、naccept时子fd已经被创建了
 			pthread_mutex_unlock(&listener->mutex);
-			
+
 #if ENABLE_SINGLE_EPOLL
 
 			struct ng_tcp_table *table = tcpInstance();
@@ -908,7 +908,7 @@ static int ng_tcp_enqueue_recvbuffer(struct ng_tcp_stream *stream, struct rte_tc
 	rte_ring_mp_enqueue(stream->rcvbuf, rfragment);
 
 	pthread_mutex_lock(&stream->mutex);
-	pthread_cond_signal(&stream->cond);
+	pthread_cond_signal(&stream->cond);//冗余
 	pthread_mutex_unlock(&stream->mutex);
 
 	return 0;
@@ -2356,7 +2356,7 @@ int nepoll_create(int size) {
 	LIST_INIT(&ep->rdlist);
 
 	if (pthread_mutex_init(&ep->mtx, NULL)) {
-		free(ep);
+		rte_free(ep);
 		set_fd_frombitmap(epfd);
 		
 		return -2;
@@ -2372,7 +2372,7 @@ int nepoll_create(int size) {
 	if (pthread_cond_init(&ep->cond, NULL)) {
 		pthread_mutex_destroy(&ep->cdmtx);
 		pthread_mutex_destroy(&ep->mtx);
-		free(ep);
+		rte_free(ep);
 		set_fd_frombitmap(epfd);
 		return -2;
 	}
@@ -2381,7 +2381,7 @@ int nepoll_create(int size) {
 		pthread_cond_destroy(&ep->cond);
 		pthread_mutex_destroy(&ep->cdmtx);
 		pthread_mutex_destroy(&ep->mtx);
-		free(ep);
+		rte_free(ep);
 
 		set_fd_frombitmap(epfd);
 		return -2;
@@ -2449,7 +2449,7 @@ int nepoll_ctl(int epfd, int op, int sockid, struct epoll_event *event) {
 		}
 
 		ep->rbcnt --;
-		free(epi);
+		rte_free(epi);
 		
 		pthread_mutex_unlock(&ep->mtx);
 
