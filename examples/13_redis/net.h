@@ -10,6 +10,9 @@ extern "C" {
 #endif
 /* IPv4 TCP/UDP APIs used by the preload adapter. */
 int nisdgram(int fd);
+int netstack_socket_supported(int domain, int type, int protocol);
+ssize_t nsendmsg(int fd, const struct msghdr *message, int flags);
+ssize_t nrecvmsg(int fd, struct msghdr *message, int flags);
 ssize_t ndgram_sendmsg(int fd, const struct msghdr *message, int flags);
 ssize_t ndgram_recvmsg(int fd, struct msghdr *message, int flags);
 

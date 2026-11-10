@@ -2,7 +2,7 @@
 CC ?= cc
 APP := dpdknet
 SRCS := main.c hook.c epoll_core.c
-HDRS := epoll_core.h net.h arp.h nty_tree.h tcp_core.h tcp_cc.h udp_core.h
+HDRS := epoll_core.h net.h arp.h nty_tree.h tcp_core.h tcp_cc.h udp_core.h socket_core.h socket_api.h
 CFLAGS += -O2 -g -fPIC -D_GNU_SOURCE -pthread -Wall -Wextra
 LDLIBS += -pthread -ldl -lm -lrt
 # Test and clean targets do not require a DPDK installation.
@@ -40,10 +40,12 @@ test: | build
 	./build/test_tcp_core
 	$(CC) -std=gnu11 -O1 -g -pthread -Wall -Wextra -Wno-unused-function tests/test_udp_core.c -o build/test_udp_core
 	./build/test_udp_core
+	$(CC) -std=gnu11 -O1 -g -pthread -Wall -Wextra -Wno-unused-function tests/test_socket_api.c -o build/test_socket_api
+	./build/test_socket_api
 	$(CC) -std=gnu11 -O1 -g -D_GNU_SOURCE -pthread tests/test_epoll_core.c epoll_core.c tests/hook_backend.c -o build/test_epoll_core
 	./build/test_epoll_core
 	$(CC) -std=gnu11 -O1 -g -D_GNU_SOURCE -pthread -shared -fPIC hook.c epoll_core.c tests/hook_backend.c -ldl -o build/libhook_test.so
 	$(CC) -std=gnu11 -O1 -g -D_GNU_SOURCE -pthread tests/test_hook.c -ldl -o build/test_hook
 	LD_PRELOAD=$(CURDIR)/build/libhook_test.so ./build/test_hook
 clean:
-	rm -f build/test_epoll_core build/lib$(APP).so build/test_tcp_cc build/test_tcp_core build/test_hook build/test_udp_core build/libhook_test.so
+	rm -f build/test_epoll_core build/lib$(APP).so build/test_tcp_cc build/test_tcp_core build/test_hook build/test_udp_core build/test_socket_api build/libhook_test.so

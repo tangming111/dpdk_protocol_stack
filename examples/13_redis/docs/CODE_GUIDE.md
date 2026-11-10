@@ -1,6 +1,6 @@
 # 13_redis 代码导读：文件结构与 hook.c 全函数说明
 
-更新日期：2026-10-18。本文对照当前源码整理，面向第一次重新阅读这个目录的人。本文只解释结构，没有修改协议栈行为。
+更新日期：2026-10-29。本文对照当前源码整理，面向第一次重新阅读这个目录的人。本文只解释结构，没有修改协议栈行为。
 
 建议先读第 1～5 节建立整体认识，再查第 8 节的 hook 函数。阅读实际源码目录，不要把 `build/format-before/` 或 `build/headers-format-before/` 中的历史备份当成正在编译的代码。
 
@@ -15,7 +15,9 @@
     ↓ LD_PRELOAD 使应用先进入我们的同名函数
 hook.c：判断 fd 归属，适配接口和事件等待
     ↓ n* 函数
-main.c：按 TCP/UDP 分发接口，组织初始化与数据面
+socket_api.h：通过静态协议表和操作表分派 n* 接口
+socket_core.h：公共 fd 管理、锁与共享辅助函数
+main.c：组织初始化与数据面
     ↓
 tcp_core.h：TCP 状态机、字节流、窗口、重传
 udp_core.h：UDP endpoint、数据报队列、收发
@@ -30,7 +32,7 @@ DPDK 软件 ring → 网卡 TX 队列 → 对端
 ```mermaid
 flowchart TD
     APP[Redis / iperf3] --> HOOK[hook.c 标准接口拦截]
-    HOOK -->|受管 IPv4 TCP/UDP fd| API[main.c 中的 n* 分发接口]
+    HOOK -->|受管 IPv4 TCP/UDP fd| API[socket_api.h 中的 n* 操作表分派]
     HOOK -->|文件、管道、AF_UNIX、IPv6 等| LIBC[后续动态库 / libc / 内核]
     API --> TCP[tcp_core.h]
     API --> UDP[udp_core.h]
@@ -58,10 +60,12 @@ AF_PACKET 测试中，底层以太网通道仍使用内核提供的设施；被�
 | [Makefile](../Makefile) | 把 main.c、hook.c、epoll_core.c 编译成 build/libdpdknet.so；提供 make test | SRCS、HDRS、共享库目标、test 目标 |
 | [hook.c](../hook.c) | 重定义标准 socket/I/O/事件函数，分流到协议栈或 libc，处理 fork 与退出 | socket、managed、REAL、epoll_wait |
 | [net.h](../net.h) | hook 和协议栈之间的声明接口 | n* API、生命周期、fd 查询函数 |
-| [main.c](../main.c) | EAL 与网卡初始化、两个数据面线程、ARP 收发、协议分发、n* 包装函数；也混有旧教学代码 | netstack_init、pkt_process、rx_tx_loop、nsocket、nready |
-| [tcp_core.h](../tcp_core.h) | TCP 控制块、fd 登记、连接状态机、发送队列、接收字节缓冲、定时处理、TCP API | socket_fd_types、ng_tcp_stream、tcp_send/recv、ng_tcp_process/out |
+| [main.c](../main.c) | EAL 与网卡初始化、两个数据面线程、ARP 收发、报文分发；也混有旧教学代码 | netstack_init、pkt_process、rx_tx_loop |
+| [socket_core.h](../socket_core.h) | 公共 fd 类型登记、分配释放、共享锁、时钟/地址等辅助函数 | socket_fd_kind、socket_fd_alloc、socket_state_lock |
+| [socket_api.h](../socket_api.h) | 静态协议注册、操作表、统一 n* 分派及消息适配 | socket_protocols、socket_ops、nsocket、nsendmsg |
+| [tcp_core.h](../tcp_core.h) | TCP 控制块、连接状态机、发送队列、接收字节缓冲、定时处理、TCP API | ng_tcp_stream、tcp_send/recv、ng_tcp_process/out |
 | [tcp_cc.h](../tcp_cc.h) | TCP 序号比较、Reno、RTT/RTO 算术 | tcp_cc_ack、tcp_cc_dupack、tcp_cc_timeout |
-| [udp_core.h](../udp_core.h) | UDP socket、数据报队列、默认对端、报文收发和 UDP API | nisdgram、udp_datagram、udp_sendto/recvfrom、ng_udp_process/out |
+| [udp_core.h](../udp_core.h) | UDP socket、数据报队列、默认对端、报文收发和 UDP API | udp_datagram、udp_sendto/recvfrom、ng_udp_process/out |
 | [arp.h](../arp.h) | ARP 表结构、链表宏、查 MAC 辅助函数 | arp_table_instance、ng_get_dst_macaddr、LL_ADD/LL_REMOVE |
 | [nty_tree.h](../nty_tree.h) | SPLAY/红黑树宏，供 epoll_core.c 的订阅树使用 | 先理解 RB_FIND/RB_INSERT/RB_REMOVE 的用途 |
 | [epoll_core.c](../epoll_core.c) / [epoll_core.h](../epoll_core.h) | 自己的 epoll：实例表、红黑树、FIFO 就绪队列、主动唤醒与等待 | nepoll_create1、nepoll_ctl、wait_events、nepoll_notify |
@@ -74,6 +78,7 @@ AF_PACKET 测试中，底层以太网通道仍使用内核提供的设施；被�
 ```c
 #include "tcp_core.h"
 #include "udp_core.h"
+#include "socket_api.h"
 ```
 
 Makefile 真正编译的源文件只有：
@@ -84,7 +89,7 @@ SRCS := main.c hook.c epoll_core.c
 
 因此，TCP/UDP 核心的函数会随着 main.c 一起编译，不需要再把这些头文件单独传给编译器。hook.c 包含 net.h 和 epoll_core.h，通过 n* 与 nepoll_* 接口访问协议栈和自己的事件实现。
 
-udp_core.h 依赖前面 TCP 实现中的公共设施，所以当前包含顺序不能随意交换。这种组织方式减少了拆分工作，但也造成“公共基础设施放在名字带 tcp 的文件里”的耦合。不要把实现头文件随意包含到其它编译单元中。
+两种协议都通过 socket_core.h 使用公共设施，不再依赖对方的实现；test_socket_api.c 特意先包含 UDP 再包含 TCP 验证这一点。socket_api.h 在两种协议之后包含，用于装配操作表。实现头文件仍只属于一个编译单元，不应重复编译或在多个生产编译单元中包含。具体设计见 [SOCKET_ARCHITECTURE.md](SOCKET_ARCHITECTURE.md)。
 
 ### 2.3 测试目录
 
@@ -92,6 +97,7 @@ udp_core.h 依赖前面 TCP 实现中的公共设施，所以当前包含顺序�
 | --- | --- |
 | tests/test_tcp_cc.c | 序号回绕、慢启动、拥塞避免、快速恢复、RTO 退避 |
 | tests/test_tcp_core.c | 编译实际 TCP 核心，模拟报文与时钟，验证握手、窗口、重传、收发、关闭和关闭后立即重绑定 |
+| tests/test_socket_api.c | 编译实际统一 API 和两种协议，验证分派、消息、fd 复用、accept 登记和 fork 清理 |
 | tests/test_udp_core.c | 编译实际 UDP 核心，验证数据报边界、校验和、peek/trunc、队列与超时 |
 | tests/packet_test_support.h | 上述报文测试使用的模拟 mbuf、ring、时钟和系统接口；不是生产 DPDK 实现 |
 | tests/test_epoll_core.c | 直接测试自己的 epoll 核心、主动唤醒、信号和关闭；支持内存检查 |
@@ -102,7 +108,7 @@ udp_core.h 依赖前面 TCP 实现中的公共设施，所以当前包含顺序�
 | tests/redis_stream.py | Redis 二进制大数据、流水线、并发和 BGSAVE 联调 |
 | tests/smoke_linux.sh | 用临时 veth/network namespace 和 DPDK AF_PACKET 跑应用联调，含同一 iperf3 服务端进程连续测试 |
 
-make test 运行拥塞控制、TCP 核心、UDP 核心、epoll 核心和 hook 五组测试。真实应用联调另运行 smoke_linux.sh。
+make test 运行拥塞控制、TCP 核心、UDP 核心、统一 socket API、epoll 核心和 hook 六组测试。真实应用联调另运行 smoke_linux.sh。
 
 ### 2.4 文档与 build 目录
 
@@ -193,29 +199,28 @@ udp_server_entry 是保留但不启动的业务示例；旧 TCP 示例入口已�
 | 1 | 用户态 TCP |
 | 2 | 用户态 UDP |
 
-socket_fd_types、tcp_fd_alloc、tcp_fd_release、tcp_fd_managed 目前定义在 tcp_core.h，但 UDP 也共用它们。socket_state_lock 同样保护两种协议的控制对象和队列。
+socket_fd_types、socket_fd_alloc、socket_fd_release、socket_fd_kind 定义在 socket_core.h，由 TCP/UDP 共用。socket_state_lock 同样保护两种协议的控制对象和队列。
 
-TCP 创建时分配 eventfd 并登记为 1；UDP 创建时复用分配函数，再登记为 2。关闭时清除登记并关闭占位 fd。
+TCP/UDP 创建时调用公共分配函数，直接登记为 STACK_SOCKET_TCP（1）或 STACK_SOCKET_UDP（2）。关闭时清除登记并关闭占位 fd。
 
 ### 4.3 当前选中的函数调用关系
 
 ```text
 hook.c: managed(fd)
-    → main.c: netstack_fd_is_managed(fd)
-        → tcp_core.h: tcp_fd_managed(fd)
-            → 检查 fd 范围
-            → 原子读取 socket_fd_types[fd]，非 0 即受管
+    → socket_core.h: netstack_fd_is_managed(fd)
+        → socket_fd_kind(fd) 检查范围并原子读取类型
+        → 已注册的有效协议类型为受管 fd
 ```
 
-区分 TCP/UDP 则调用 udp_core.h 中的 nisdgram(fd)，判断登记值是否为 2。
+nisdgram(fd) 在 socket_core.h 中保留为兼容查询接口。正常 n* API 使用 fd 类型直接索引操作表，hook 不再用 nisdgram 分派消息操作。
 
 例如 fd=15 已登记为 UDP：
 
 ```text
 应用 sendto(15, ...)
     → hook: managed(15) 为真
-    → main: nsendto(15, ...)
-    → nisdgram(15) 为真
+    → socket_api.h: nsendto(15, ...)
+    → socket_ops_for_fd(15) 返回 udp_ops
     → udp_sendto(15, ...)
 ```
 
@@ -402,33 +407,19 @@ managed(fd) 为真就调用 nbind，由 main.c 分到 tcp_bind 或 udp_bind。�
 
 ### vector_io()
 
-readv/writev 和 TCP 消息接口的公共辅助函数。is_write=1 为发送，is_write=0 为接收。
+readv/writev 的公共适配函数。检查 iovec 数量和数组指针，构造一个 msghdr，再调用统一的 nsendmsg/nrecvmsg。hook 不判断 TCP/UDP。
 
-UDP 分支检查 iovec 数量、构造 msghdr，直接进入 ndgram_sendmsg/ndgram_recvmsg。多个 iovec 共同对应一个数据报。
+### readv()/writev()
 
-TCP 分支先检查 iovec 数量和总长度溢出，单次最多处理 1MiB，分配连续临时缓冲区。发送时按顺序聚合 iovec，再调用一次 nsend；接收时调用一次 nrecv，再按实际返回字节数分散写入 iovec。最后释放临时缓冲区。
+受管 fd 经 vector_io 交给统一消息接口，其它 fd 调用 libc。多个 UDP iovec 对应一个数据报；TCP 按字节流顺序读写。
 
-只调用一次接收还能避免逐个 iovec 使用 MSG_PEEK 时，反复从同一接收位置读取。该函数有额外内存分配和拷贝，不是零拷贝。
+### sendmsg()/recvmsg()
 
-### readv()
+受管 fd 调用 nsendmsg/nrecvmsg，通过操作表选择协议适配器；其它 fd 原样调用 libc。
 
-受管 fd 调用 vector_io(fd, iovecs, iov_count, 0, 0)；其它 fd 调用 REAL(readv)。数据按 iovec 顺序填入，UDP 分支保持单数据报语义。
+UDP 适配器保留目标/来源地址、MSG_TRUNC 和完整数据报边界。TCP 适配器在 socket_api.h 中保留原有 gather/scatter 逻辑：单次最多处理 1MiB，发送聚合后调用一次 tcp_send，接收调用一次 tcp_recv 后分散填入 iovec，因此 MSG_PEEK 不会重复读取同一段数据。它仍包含临时缓冲区分配和拷贝。
 
-### writev()
-
-受管 fd 调用 vector_io(fd, iovecs, iov_count, 0, 1)；其它 fd 调用 REAL(writev)。UDP 的多个缓冲区不会被拆成多个 UDP 包。
-
-### sendmsg()
-
-非受管 fd 原样调用 libc。受管 UDP 交给 ndgram_sendmsg，支持目标地址与向量数据。
-
-TCP 分支检查 msghdr 指针和 iovec 数量；若带辅助数据 msg_controllen 或 msg_name，则返回 EOPNOTSUPP。随后通过 vector_io 聚合发送。这里没有实现文件描述符传递等控制消息。
-
-### recvmsg()
-
-非受管 fd 原样调用 libc。受管 UDP 交给 ndgram_recvmsg，支持来源地址和 MSG_TRUNC。
-
-TCP 分支检查指针及 iovec 数量，通过 vector_io 接收；成功后将 msg_flags 和 msg_controllen 清零。如果提供 msg_name，则调用 ngetpeername 尝试填对端地址。当前代码没有把该地址查询的返回值作为本次接收错误返回。
+TCP sendmsg 拒绝 msg_name 和辅助数据；recvmsg 成功后清零 msg_flags/msg_controllen，并在请求时查询对端地址，保留原有地址查询返回值处理方式。旧 ndgram_sendmsg/ndgram_recvmsg 导出接口保留用于兼容，但 hook 已不再使用。
 
 ### shutdown()
 
@@ -558,7 +549,7 @@ fork 之前先通过 nepoll_fork_prepare 锁 epoll_lock，再调用 nfork_prepar
 
 ### hook_fork_child()
 
-子进程中调用 nfork_child 清除受管登记、调整核心状态并释放核心锁；将 fork_child_mode 置 1、initializing 清零，再通过 nepoll_fork_child 清除继承 epoll 的用户态归属并释放 epoll_lock。
+子进程中调用 nfork_child，遍历协议注册表执行各协议的 fork_child_reset，然后清除受管登记并释放核心锁；将 fork_child_mode 置 1、initializing 清零，再通过 nepoll_fork_child 清除继承 epoll 的用户态归属并释放 epoll_lock。
 
 子进程没有继承可运行的其它线程，所以不会继续用父进程的 DPDK 数据面。继承的占位 fd 可以按普通内核 fd 关闭，新 socket 走 libc。它不提供 fork 后继续使用原用户态网络连接的功能。
 
@@ -628,7 +619,7 @@ recvfrom
 | --- | --- |
 | main.c 应该包含程序 main() | 它现在是共享库实现文件，应用入口在 Redis/iperf3 自己的程序中 |
 | .h 只能有声明 | tcp_core.h/udp_core.h 是被 main.c 包含的实现头文件 |
-| 名字带 tcp 的帮助函数都只用于 TCP | tcp_fd_alloc/tcp_fd_release 被 UDP 共用；socket_state_lock/socket_fd_types 已改为公共命名 |
+| 公共 fd 管理还在 TCP 文件中 | 已移至 socket_core.h，协议核心各自保留状态机和队列 |
 | eventfd 是内核 fd，所以数据一定走内核 TCP | eventfd 只占编号；网络负载走本栈缓冲与 DPDK |
 | 用了 eventfd 就等于用了内核 epoll | 本版 eventfd 是句柄和门铃，订阅、队列和事件分发由自己的 epoll_core.c 完成 |
 | main.c 和 hook 中还各有一套 epoll | 已统一到 epoll_core.c 的 nepoll_*，旧实现已移除 |
@@ -646,7 +637,7 @@ recvfrom
 1. 本文第 1～4 节，理解三层和 fd 归属。
 2. net.h，知道 hook 可以调用哪些协议栈接口。
 3. hook.c 的 socket、managed、send/recv、epoll_wait。
-4. main.c 的 n* 包装、netstack_init_once、pkt_process、rx_tx_loop。
+4. socket_api.h 的注册表和 n* 包装；socket_core.h 的 fd 管理；main.c 的 netstack_init_once、pkt_process、rx_tx_loop。
 5. udp_core.h 的 udp_socket_create、udp_sendto、udp_recvfrom、ng_udp_process、ng_udp_out。
 6. tcp_core.h 的 TCB、tcp_send/recv、ng_tcp_process、ng_tcp_out。
 7. tcp_cc.h，最后再看拥塞控制细节。
@@ -658,7 +649,7 @@ recvfrom
 以下 rg 命令在 DPDK 仓库根目录执行；如当前位于 examples/13_redis，先执行 `cd ../..`。
 
 ```bash
-rg -n -g '*.[ch]' -g '!**/build/**' 'netstack_fd_is_managed|tcp_fd_managed|nisdgram' examples/13_redis
+rg -n -g '*.[ch]' -g '!**/build/**' 'netstack_fd_is_managed|socket_fd_kind|socket_ops_for_fd' examples/13_redis
 rg -n 'ng_tcp_process|ng_udp_process|ng_tcp_out|ng_udp_out' examples/13_redis/main.c
 rg -n -g '*.[ch]' -g '!**/build/**' 'nready|tcp_ready|udp_ready' examples/13_redis
 ```
@@ -679,7 +670,7 @@ rg -n -g '*.[ch]' -g '!**/build/**' 'nready|tcp_ready|udp_ready' examples/13_red
 - 队列使用 send_head/send_tail、recv_head/recv_tail；TCP 字节接收缓冲使用 recv_buffer，不能与 UDP 数据报链表混淆。
 - 容量和已用量使用 `_bytes`，数据长度使用 `_len`，报文数量使用 `_count`；绝对时刻和时间间隔明确 `_ms` 或 `_sec`。
 - 临时对象使用 tcp_stream、udp_endpoint、segment、datagram、packet、ipv4_header、tcp_header、udp_header、poll_instance、watch，避免用 s/p/m/t 表示多个不同对象。
-- socket_state_lock 和 socket_fd_types 同时服务 TCP/UDP；少数公共帮助函数仍保留 tcp_fd_* 的旧函数名，避免把变量整理扩展成接口改动。
+- socket_state_lock 和 socket_fd_types 同时服务 TCP/UDP，位于 socket_core.h；公共辅助函数统一使用 socket_ 前缀。
 - 保留 fd、IP、TCP 等通用缩写及系统/DPDK 的结构字段；库导出的函数名、标准 socket 接口和报文格式没有改变。
 
 TCP 控制块的常见旧名称对应：sip → peer_ip，dip → local_ip，sport → peer_port，dport → local_port；snd_nxt → send_next_seq，rcv_nxt → recv_next_seq，snd_alloc → send_queued_end_seq；cwnd → congestion_window，ssthresh → slow_start_threshold，rto → retransmit_timeout_ms。last_sent_ms、queued_at_ms 等字段使用单调时钟毫秒，具体特殊值语义见字段注释。

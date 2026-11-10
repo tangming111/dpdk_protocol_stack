@@ -17,6 +17,32 @@
 #define AF_INET 2
 #define SOCK_STREAM 1
 #define IPPROTO_TCP 6
+#define IPPROTO_UDP 17
+#define SOCK_DGRAM 2
+#define AF_UNSPEC 0
+#define MSG_TRUNC 0x20
+#define MSG_OOB 1
+#define SOL_IP 0
+#define IPPROTO_IP 0
+#define IP_TOS 1
+#define IP_TTL 2
+#define IP_MTU_DISCOVER 10
+#define IP_MTU 14
+#define IP_PMTUDISC_DONT 0
+#define IP_PMTUDISC_DO 2
+struct iovec {
+    void *iov_base;
+    size_t iov_len;
+};
+struct msghdr {
+    void *msg_name;
+    unsigned msg_namelen;
+    struct iovec *msg_iov;
+    size_t msg_iovlen;
+    void *msg_control;
+    size_t msg_controllen;
+    int msg_flags;
+};
 #define SOL_SOCKET 1
 #define SO_ERROR 4
 #define SO_TYPE 3
@@ -82,10 +108,12 @@ struct tcp_info {
     uint32_t tcpi_snd_cwnd, tcpi_snd_ssthresh, tcpi_snd_mss, tcpi_rcv_mss, tcpi_rto, tcpi_rtt,
         tcpi_rttvar, tcpi_total_retrans, tcpi_unacked;
 };
+typedef unsigned short sa_family_t;
 typedef unsigned socklen_t;
 #else
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -180,11 +208,19 @@ static int fake_clock(clockid_t id, struct timespec *timestamp)
 }
 
 #define clock_gettime fake_clock
+static int fake_next_fd = 10;
+static int fake_reuse_fd = -1;
 static long fake_syscall(long op, ...)
 {
-    static int fd = 10;
     (void)op;
-    return op == SYS_eventfd2 ? fd++ : 0;
+    if (op != SYS_eventfd2)
+        return 0;
+    if (fake_reuse_fd >= 0) {
+        int fd = fake_reuse_fd;
+        fake_reuse_fd = -1;
+        return fd;
+    }
+    return fake_next_fd++;
 }
 
 #define syscall fake_syscall

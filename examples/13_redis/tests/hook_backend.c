@@ -1,5 +1,9 @@
 /* Fake stack backend exercises hook.c against real Linux descriptors. */
 #include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <netinet/in.h>
+#include <sys/uio.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -219,4 +223,97 @@ ssize_t ndgram_recvmsg(int fd, struct msghdr *message, int flags)
     (void)flags;
     errno = EOPNOTSUPP;
     return -1;
+}
+
+int netstack_socket_supported(int domain, int type, int protocol)
+{
+    return domain == AF_INET &&
+           (((type & 15) == SOCK_STREAM && (!protocol || protocol == IPPROTO_TCP)) ||
+            ((type & 15) == SOCK_DGRAM && (!protocol || protocol == IPPROTO_UDP)));
+}
+
+static ssize_t vector_io(int fd, const struct iovec *iovecs, int iov_count, int flags, int is_write)
+{
+    if (iov_count < 0 || iov_count > IOV_MAX || (iov_count && !iovecs)) {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t total_bytes = 0;
+    for (int i = 0; i < iov_count; ++i) {
+        if (iovecs[i].iov_len > (size_t)SSIZE_MAX - total_bytes) {
+            errno = EINVAL;
+            return -1;
+        }
+        total_bytes += iovecs[i].iov_len;
+    }
+    if (!total_bytes)
+        return is_write ? nsend(fd, "", 0, flags) : nrecv(fd, NULL, 0, flags);
+    /* A single gather/scatter preserves stream order and MSG_PEEK semantics. */
+    if (total_bytes > 1024 * 1024)
+        total_bytes = 1024 * 1024;
+    unsigned char *io_buffer = malloc(total_bytes);
+    if (!io_buffer) {
+        errno = ENOMEM;
+        return -1;
+    }
+    size_t copied_bytes = 0;
+    if (is_write)
+        for (int i = 0; i < iov_count && copied_bytes < total_bytes; ++i) {
+            size_t chunk_bytes = iovecs[i].iov_len;
+            if (chunk_bytes > total_bytes - copied_bytes)
+                chunk_bytes = total_bytes - copied_bytes;
+            memcpy(io_buffer + copied_bytes, iovecs[i].iov_base, chunk_bytes);
+            copied_bytes += chunk_bytes;
+        }
+    ssize_t result = is_write ? nsend(fd, io_buffer, total_bytes, flags)
+                              : nrecv(fd, io_buffer, total_bytes, flags);
+    if (!is_write && result > 0) {
+        copied_bytes = 0;
+        for (int i = 0; i < iov_count && copied_bytes < (size_t)result; ++i) {
+            size_t chunk_bytes = iovecs[i].iov_len;
+            if (chunk_bytes > (size_t)result - copied_bytes)
+                chunk_bytes = result - copied_bytes;
+            memcpy(iovecs[i].iov_base, io_buffer + copied_bytes, chunk_bytes);
+            copied_bytes += chunk_bytes;
+        }
+    }
+    free(io_buffer);
+    return result;
+}
+
+ssize_t nsendmsg(int fd, const struct msghdr *message, int flags)
+{
+    if (!message) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (message->msg_controllen || message->msg_name) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    if (message->msg_iovlen > IOV_MAX) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    return vector_io(fd, message->msg_iov, message->msg_iovlen, flags, 1);
+}
+
+ssize_t nrecvmsg(int fd, struct msghdr *message, int flags)
+{
+    if (!message) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (message->msg_iovlen > IOV_MAX) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    ssize_t result = vector_io(fd, message->msg_iov, message->msg_iovlen, flags, 0);
+    if (result >= 0) {
+        message->msg_flags = 0;
+        message->msg_controllen = 0;
+        if (message->msg_name)
+            ngetpeername(fd, message->msg_name, &message->msg_namelen);
+    }
+    return result;
 }

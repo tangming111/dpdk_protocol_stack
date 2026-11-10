@@ -6,7 +6,7 @@
 #include "tcp_cc.h"
 #define TCP_RX_CAP 65535u
 #define TCP_TX_CAP (1024u * 1024u)
-#define STACK_MAX_FDS 65536
+#include "socket_core.h"
 #define NG_TCP_MSS 1460u
 #define TCP_MAX_RETRIES 8
 #define TCP_TIME_WAIT_MS 60000u
@@ -61,68 +61,14 @@ struct ng_tcp_table {
     struct ng_tcp_stream *streams;
 };
 static struct ng_tcp_table tcp_table;
-static pthread_mutex_t socket_state_lock = PTHREAD_MUTEX_INITIALIZER;
-static unsigned char socket_fd_types[STACK_MAX_FDS];
-static int stack_fork_child;
-void nfork_prepare(void)
+static void tcp_fork_child_reset(void)
 {
-    pthread_mutex_lock(&socket_state_lock);
-}
-
-void nfork_parent(void)
-{
-    pthread_mutex_unlock(&socket_state_lock);
-}
-
-void nfork_child(void)
-{
-    /* The child has no data-plane threads. Inherited fds become kernel handles
-     * for close(), while the parent retains all TCP connections and queues. */
-    memset(socket_fd_types, 0, sizeof(socket_fd_types));
     tcp_table.streams = NULL;
-    stack_fork_child = 1;
-    pthread_mutex_unlock(&socket_state_lock);
-}
-
-static uint64_t tcp_now(void)
-{
-    struct timespec timestamp;
-    clock_gettime(CLOCK_MONOTONIC, &timestamp);
-    return (uint64_t)timestamp.tv_sec * 1000 + timestamp.tv_nsec / 1000000;
 }
 
 static struct ng_tcp_table *tcpInstance(void)
 {
     return &tcp_table;
-}
-
-static int tcp_fd_managed(int fd)
-{
-    return fd >= 0 && fd < STACK_MAX_FDS && __atomic_load_n(&socket_fd_types[fd], __ATOMIC_ACQUIRE);
-}
-
-static int tcp_fd_alloc(void)
-{
-    int fd = (int)syscall(SYS_eventfd2, 0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (fd < 0)
-        return -1;
-    if (fd >= STACK_MAX_FDS) {
-        syscall(SYS_close, fd);
-        errno = EMFILE;
-        return -1;
-    }
-    __atomic_store_n(&socket_fd_types[fd], 1, __ATOMIC_RELEASE);
-    return fd;
-}
-
-static int tcp_fd_release(int fd)
-{
-    if (!tcp_fd_managed(fd)) {
-        errno = EBADF;
-        return -1;
-    }
-    __atomic_store_n(&socket_fd_types[fd], 0, __ATOMIC_RELEASE);
-    return (int)syscall(SYS_close, fd);
 }
 
 static struct ng_tcp_stream *tcp_find(int fd)
@@ -172,7 +118,7 @@ static struct ng_tcp_stream *tcp_new(int fd)
     tcp_stream->listener_fd = -1;
     tcp_stream->protocol = IPPROTO_TCP;
     tcp_stream->peer_recv_window = 65535;
-    tcp_stream->state_changed_ms = tcp_stream->last_received_ms = tcp_now();
+    tcp_stream->state_changed_ms = tcp_stream->last_received_ms = socket_now();
     tcp_stream->keepalive_idle_sec = 300;
     tcp_stream->keepalive_interval_sec = 75;
     tcp_stream->keepalive_probe_limit = 9;
@@ -228,7 +174,7 @@ static int tcp_emit(struct ng_tcp_stream *tcp_stream, struct rte_mempool *packet
     uint8_t *peer_mac = ng_get_dst_macaddr(tcp_stream->peer_ip);
     struct inout_ring *ring = ring_instance();
     if (!peer_mac) {
-        uint64_t now_ms = tcp_now();
+        uint64_t now_ms = socket_now();
         if (now_ms - tcp_stream->last_arp_request_ms >= 1000) {
             struct rte_mbuf *arp_packet =
                 ng_send_arp(packet_pool, RTE_ARP_OP_REQUEST, g_arp_broadcast_mac,
@@ -293,7 +239,7 @@ static void tcp_fail(struct ng_tcp_stream *tcp_stream, int error)
 {
     tcp_stream->error = error;
     tcp_stream->status = NG_TCP_STATUS_CLOSED;
-    tcp_stream->state_changed_ms = tcp_now();
+    tcp_stream->state_changed_ms = socket_now();
 }
 
 static void tcp_ack(struct ng_tcp_stream *tcp_stream, uint32_t ack, int duplicate)
@@ -301,7 +247,7 @@ static void tcp_ack(struct ng_tcp_stream *tcp_stream, uint32_t ack, int duplicat
     if (tcp_seq_after(ack, tcp_stream->send_next_seq) ||
         tcp_seq_before(ack, tcp_stream->congestion.send_unacked_seq))
         return;
-    uint64_t now_ms = tcp_now();
+    uint64_t now_ms = socket_now();
     if (ack == tcp_stream->congestion.send_unacked_seq) {
         if (duplicate && tcp_stream->send_head && tcp_stream->send_head->was_sent &&
             tcp_cc_dupack(&tcp_stream->congestion, tcp_stream->send_next_seq))
@@ -371,15 +317,6 @@ static void tcp_mss(struct ng_tcp_stream *tcp_stream, struct rte_tcp_hdr *tcp_he
     }
 }
 
-static int tcp_ipv4_valid(struct rte_ipv4_hdr *ipv4_header)
-{
-    uint16_t saved = ipv4_header->hdr_checksum;
-    ipv4_header->hdr_checksum = 0;
-    uint16_t expected = rte_ipv4_cksum(ipv4_header);
-    ipv4_header->hdr_checksum = saved;
-    return saved == expected;
-}
-
 static int ng_tcp_process(struct rte_mbuf *packet)
 {
     unsigned l2 = sizeof(struct rte_ether_hdr), available_bytes = rte_pktmbuf_data_len(packet);
@@ -393,7 +330,7 @@ static int ng_tcp_process(struct rte_mbuf *packet)
     if ((ipv4_header->version_ihl >> 4) != 4 || ipv4_header_len != 20 ||
         ipv4_packet_len < ipv4_header_len + 20 || ipv4_packet_len > available_bytes - l2 ||
         (ntohs(ipv4_header->fragment_offset) & 0x3fff) ||
-        ipv4_header->dst_addr != g_stack_ipv4_addr || !tcp_ipv4_valid(ipv4_header)) {
+        ipv4_header->dst_addr != g_stack_ipv4_addr || !socket_ipv4_valid(ipv4_header)) {
         rte_pktmbuf_free(packet);
         return -1;
     }
@@ -497,7 +434,7 @@ static int ng_tcp_process(struct rte_mbuf *packet)
             tcp_mss(tcp_stream, tcp_header, tcp_header_len);
             tcp_stream->status = NG_TCP_STATUS_ESTABLISHED;
             tcp_stream->ack_pending = 1;
-            tcp_stream->state_changed_ms = tcp_now();
+            tcp_stream->state_changed_ms = socket_now();
         }
         goto done;
     }
@@ -526,7 +463,7 @@ static int ng_tcp_process(struct rte_mbuf *packet)
         tcp_stream->ack_pending = 1;
         goto done;
     }
-    tcp_stream->last_received_ms = tcp_now();
+    tcp_stream->last_received_ms = socket_now();
     tcp_stream->keepalive_probes_sent = 0;
     if (tcp_header->tcp_flags & RTE_TCP_ACK_FLAG) {
         if (tcp_seq_after(ack_seq, tcp_stream->send_next_seq)) {
@@ -564,13 +501,13 @@ static int ng_tcp_process(struct rte_mbuf *packet)
         tcp_stream->ack_pending = 1;
     }
     if (tcp_stream->status == NG_TCP_STATUS_TIME_WAIT && (tcp_header->tcp_flags & RTE_TCP_FIN_FLAG))
-        tcp_stream->state_changed_ms = tcp_now();
+        tcp_stream->state_changed_ms = socket_now();
     if (!tcp_stream->peer_eof && (tcp_header->tcp_flags & RTE_TCP_FIN_FLAG) &&
         segment_seq + payload_len == tcp_stream->recv_next_seq) {
         ++tcp_stream->recv_next_seq;
         tcp_stream->peer_eof = 1;
         tcp_stream->ack_pending = 1;
-        tcp_stream->state_changed_ms = tcp_now();
+        tcp_stream->state_changed_ms = socket_now();
         if (tcp_stream->status == NG_TCP_STATUS_ESTABLISHED)
             tcp_stream->status = NG_TCP_STATUS_CLOSE_WAIT;
         else if (tcp_stream->status == NG_TCP_STATUS_FIN_WAIT_1)
@@ -588,7 +525,7 @@ done:
 static int ng_tcp_out(struct rte_mempool *packet_pool)
 {
     pthread_mutex_lock(&socket_state_lock);
-    uint64_t now_ms = tcp_now();
+    uint64_t now_ms = socket_now();
     struct ng_tcp_stream *tcp_stream = tcp_table.streams;
     while (tcp_stream) {
         struct ng_tcp_stream *next = tcp_stream->next;
@@ -702,15 +639,6 @@ static int ng_tcp_out(struct rte_mempool *packet_pool)
     return 0;
 }
 
-/* Blocking API waits release the TCB lock, then relookup the fd after waking. */
-static void tcp_pause(void)
-{
-    struct timespec timestamp = {0, 1000000};
-    pthread_mutex_unlock(&socket_state_lock);
-    nanosleep(&timestamp, NULL);
-    pthread_mutex_lock(&socket_state_lock);
-}
-
 static int tcp_socket(int domain, int type, int protocol)
 {
     if (stack_fork_child) {
@@ -722,11 +650,11 @@ static int tcp_socket(int domain, int type, int protocol)
         return -1;
     }
     pthread_mutex_lock(&socket_state_lock);
-    int fd = tcp_fd_alloc();
+    int fd = socket_fd_alloc(STACK_SOCKET_TCP);
     if (fd >= 0) {
         struct ng_tcp_stream *tcp_stream = tcp_new(fd);
         if (!tcp_stream) {
-            tcp_fd_release(fd);
+            socket_fd_release(fd);
             fd = -1;
         } else {
             tcp_stream->flags = (type & SOCK_NONBLOCK) ? O_NONBLOCK : 0;
@@ -826,24 +754,6 @@ static int tcp_listen(int fd, int backlog)
     return result;
 }
 
-static int tcp_copy_addr(struct sockaddr *socket_addr, socklen_t *address_len, uint32_t ipv4_addr,
-                         uint16_t port_number)
-{
-    if (!address_len || !socket_addr) {
-        errno = EFAULT;
-        return -1;
-    }
-    struct sockaddr_in other_socket_addr;
-    memset(&other_socket_addr, 0, sizeof(other_socket_addr));
-    other_socket_addr.sin_family = AF_INET;
-    other_socket_addr.sin_addr.s_addr = ipv4_addr;
-    other_socket_addr.sin_port = port_number;
-    memcpy(socket_addr, &other_socket_addr,
-           *address_len < sizeof(other_socket_addr) ? *address_len : sizeof(other_socket_addr));
-    *address_len = sizeof(other_socket_addr);
-    return 0;
-}
-
 static int tcp_name(int fd, struct sockaddr *socket_addr, socklen_t *address_len, int peer)
 {
     pthread_mutex_lock(&socket_state_lock);
@@ -854,7 +764,7 @@ static int tcp_name(int fd, struct sockaddr *socket_addr, socklen_t *address_len
     else if (peer && !tcp_stream->peer_port)
         errno = ENOTCONN;
     else
-        result = tcp_copy_addr(socket_addr, address_len,
+        result = socket_copy_addr(socket_addr, address_len,
                                peer ? tcp_stream->peer_ip : tcp_stream->local_ip,
                                peer ? tcp_stream->peer_port : tcp_stream->local_port);
     pthread_mutex_unlock(&socket_state_lock);
@@ -886,14 +796,14 @@ static int tcp_accept(int fd, struct sockaddr *socket_addr, socklen_t *address_l
                  candidate_stream->status == NG_TCP_STATUS_CLOSE_WAIT))
                 break;
         if (candidate_stream) {
-            result = tcp_fd_alloc();
+            result = socket_fd_alloc(STACK_SOCKET_TCP);
             if (result < 0)
                 break;
             candidate_stream->fd = result;
             candidate_stream->listener_fd = -1;
             syscall(SYS_fcntl, result, F_SETFD, 0);
             if (socket_addr)
-                tcp_copy_addr(socket_addr, address_len, candidate_stream->peer_ip,
+                socket_copy_addr(socket_addr, address_len, candidate_stream->peer_ip,
                               candidate_stream->peer_port);
             break;
         }
@@ -901,7 +811,7 @@ static int tcp_accept(int fd, struct sockaddr *socket_addr, socklen_t *address_l
             errno = EAGAIN;
             break;
         }
-        tcp_pause();
+        socket_pause();
     }
     pthread_mutex_unlock(&socket_state_lock);
     return result;
@@ -931,7 +841,7 @@ static int tcp_connect(int fd, const struct sockaddr *socket_addr, socklen_t add
         tcp_stream->local_ip = g_stack_ipv4_addr;
         tcp_stream->peer_ip = other_socket_addr->sin_addr.s_addr;
         tcp_stream->peer_port = other_socket_addr->sin_port;
-        tcp_stream->state_changed_ms = tcp_now();
+        tcp_stream->state_changed_ms = socket_now();
         tcp_stream->status = NG_TCP_STATUS_SYN_SENT;
         if (tcp_queue(tcp_stream, NULL, 0, RTE_TCP_SYN_FLAG) < 0)
             tcp_fail(tcp_stream, ENOMEM);
@@ -953,7 +863,7 @@ static int tcp_connect(int fd, const struct sockaddr *socket_addr, socklen_t add
                 errno = EINPROGRESS;
                 break;
             }
-            tcp_pause();
+            socket_pause();
         }
     }
     pthread_mutex_unlock(&socket_state_lock);
@@ -1015,7 +925,7 @@ static ssize_t tcp_send(int fd, const void *buffer, size_t buffer_len, int flags
             errno = EAGAIN;
             break;
         }
-        tcp_pause();
+        socket_pause();
     }
     pthread_mutex_unlock(&socket_state_lock);
     return result;
@@ -1080,7 +990,7 @@ static ssize_t tcp_recv(int fd, void *buffer, size_t buffer_len, int flags)
             errno = EAGAIN;
             break;
         }
-        tcp_pause();
+        socket_pause();
     }
     pthread_mutex_unlock(&socket_state_lock);
     return result;
@@ -1109,7 +1019,7 @@ static int tcp_finish(struct ng_tcp_stream *tcp_stream, int how)
         tcp_stream->status = tcp_stream->status == NG_TCP_STATUS_CLOSE_WAIT
                                  ? NG_TCP_STATUS_LAST_ACK
                                  : NG_TCP_STATUS_FIN_WAIT_1;
-        tcp_stream->state_changed_ms = tcp_now();
+        tcp_stream->state_changed_ms = socket_now();
     }
     return 0;
 }
@@ -1156,7 +1066,7 @@ static int tcp_close(int fd)
         tcp_stream->status = NG_TCP_STATUS_CLOSED;
     tcp_stream->fd = -1;
     tcp_stream->listener_fd = -1;
-    int result = tcp_fd_release(fd);
+    int result = socket_fd_release(fd);
     pthread_mutex_unlock(&socket_state_lock);
     return result;
 }
@@ -1267,7 +1177,7 @@ static int tcp_setsockopt(int fd, int level, int opt, const void *value, socklen
             case SO_KEEPALIVE:
                 tcp_stream->keepalive_enabled = !!option_value;
                 tcp_stream->keepalive_probes_sent = 0;
-                tcp_stream->last_received_ms = tcp_now();
+                tcp_stream->last_received_ms = socket_now();
                 break;
             case SO_SNDBUF:
             case SO_RCVBUF:

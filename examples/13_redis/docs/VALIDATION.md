@@ -122,3 +122,15 @@ TCP/UDP 地址方向、队列、拥塞控制、时间单位及主要局部变量
 | 26个文档 bash 命令块的 bash -n 语法检查 | 通过 |
 
 验证脚本 build/validate_ip_lab.sh 返回0，共9条 PASS，原始日志为 build/ip-lab-validation.log 和 build/ip-lab-*.log。验证时每轮打流2秒；文档手动示例为10秒。命名空间和接口名称使用PID后缀避免冲突，测试对象在退出时清理；原有dnmanual保持未动。
+
+## 2026-11-05 Nginx QUIC/HTTP3 联调
+
+使用现有build/libdpdknet.so，Nginx1.30.6 + OpenSSL3.5.1，poll事件后端、单进程、指定IPv4监听、关闭QUIC GSO；独立AF_PACKET/veth/netns。实际通过普通HTTP/TCP、QUIC ALPN=h3握手、HTTP/3小文件、256KiB文件及同连接四并发流。审计nisdgram确认UDP socket归本so管理，Nginx访问日志包含六条200 HTTP/3.0 http3=h3。
+
+SIGTERM退出未通过；最终脚本等待3秒后强制终止自己创建的Nginx PID并清理临时网络。没有修改协议栈实现，不将该限制计为修复。完整配置、版本、证据和复跑方法见 [NGINX_QUIC.md](NGINX_QUIC.md)。成功日志为build/quic-lab/logs/smoke-nginx-quic.log，原始目录为build/quic-lab/run-20261104-082701-92368（Linux日志时钟与会话日期不同）。
+
+### 2026-11-05 默认epoll、多worker与QUIC补测
+
+使用原so、Nginx1.30.6，五种模式均实际运行TCP和QUIC客户端。single-poll全部通过；single-default自动选择epoll，QUIC的h3握手、六请求和四并发流通过，但TCP失败，出现epoll_ctl/EOPNOTSUPP(95)。master-poll和master-default均确认两个worker启动，TCP超时、QUIC握手失败。master-default-reuseport在启动时因SO_REUSEPORT/ENOPROTOOPT(92)失败。
+
+汇总与日志：build/quic-lab/modes-20261104-084421-92664。详见[NGINX_QUIC.md第6节](NGINX_QUIC.md#6-默认epoll与masterworker补充实测)。本轮只扩展测试与文档，未修改或替换协议栈so；临时进程组及网络已清理。

@@ -48,9 +48,7 @@ static int64_t now_ms(void)
 
 int socket(int domain, int type, int protocol)
 {
-    if (!initializing && !fork_child_mode && domain == AF_INET &&
-        (((type & 15) == SOCK_STREAM && (!protocol || protocol == IPPROTO_TCP)) ||
-         ((type & 15) == SOCK_DGRAM && (!protocol || protocol == IPPROTO_UDP)))) {
+    if (!initializing && !fork_child_mode && netstack_socket_supported(domain, type, protocol)) {
         initializing = 1;
         int result = netstack_init();
         initializing = 0;
@@ -150,62 +148,15 @@ ssize_t sendto(int fd, const void *buffer, size_t buffer_len, int flags,
 
 static ssize_t vector_io(int fd, const struct iovec *iovecs, int iov_count, int flags, int is_write)
 {
-    if (nisdgram(fd)) {
-        if (iov_count < 0 || iov_count > IOV_MAX || (iov_count && !iovecs)) {
-            errno = EINVAL;
-            return -1;
-        }
-        struct msghdr message;
-        memset(&message, 0, sizeof(message));
-        message.msg_iov = (struct iovec *)iovecs;
-        message.msg_iovlen = iov_count;
-        return is_write ? ndgram_sendmsg(fd, &message, flags) : ndgram_recvmsg(fd, &message, flags);
-    }
     if (iov_count < 0 || iov_count > IOV_MAX || (iov_count && !iovecs)) {
         errno = EINVAL;
         return -1;
     }
-    size_t total_bytes = 0;
-    for (int i = 0; i < iov_count; ++i) {
-        if (iovecs[i].iov_len > (size_t)SSIZE_MAX - total_bytes) {
-            errno = EINVAL;
-            return -1;
-        }
-        total_bytes += iovecs[i].iov_len;
-    }
-    if (!total_bytes)
-        return is_write ? nsend(fd, "", 0, flags) : nrecv(fd, NULL, 0, flags);
-    /* A single gather/scatter preserves stream order and MSG_PEEK semantics. */
-    if (total_bytes > 1024 * 1024)
-        total_bytes = 1024 * 1024;
-    unsigned char *io_buffer = malloc(total_bytes);
-    if (!io_buffer) {
-        errno = ENOMEM;
-        return -1;
-    }
-    size_t copied_bytes = 0;
-    if (is_write)
-        for (int i = 0; i < iov_count && copied_bytes < total_bytes; ++i) {
-            size_t chunk_bytes = iovecs[i].iov_len;
-            if (chunk_bytes > total_bytes - copied_bytes)
-                chunk_bytes = total_bytes - copied_bytes;
-            memcpy(io_buffer + copied_bytes, iovecs[i].iov_base, chunk_bytes);
-            copied_bytes += chunk_bytes;
-        }
-    ssize_t result = is_write ? nsend(fd, io_buffer, total_bytes, flags)
-                              : nrecv(fd, io_buffer, total_bytes, flags);
-    if (!is_write && result > 0) {
-        copied_bytes = 0;
-        for (int i = 0; i < iov_count && copied_bytes < (size_t)result; ++i) {
-            size_t chunk_bytes = iovecs[i].iov_len;
-            if (chunk_bytes > (size_t)result - copied_bytes)
-                chunk_bytes = result - copied_bytes;
-            memcpy(iovecs[i].iov_base, io_buffer + copied_bytes, chunk_bytes);
-            copied_bytes += chunk_bytes;
-        }
-    }
-    free(io_buffer);
-    return result;
+    struct msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = (struct iovec *)iovecs;
+    message.msg_iovlen = iov_count;
+    return is_write ? nsendmsg(fd, &message, flags) : nrecvmsg(fd, &message, flags);
 }
 
 ssize_t readv(int fd, const struct iovec *iovecs, int iov_count)
@@ -230,47 +181,12 @@ ssize_t writev(int fd, const struct iovec *iovecs, int iov_count)
 
 ssize_t sendmsg(int fd, const struct msghdr *message, int flags)
 {
-    if (!managed(fd))
-        return REAL(sendmsg, fd, message, flags);
-    if (nisdgram(fd))
-        return ndgram_sendmsg(fd, message, flags);
-    if (!message) {
-        errno = EFAULT;
-        return -1;
-    }
-    if (message->msg_controllen || message->msg_name) {
-        errno = EOPNOTSUPP;
-        return -1;
-    }
-    if (message->msg_iovlen > IOV_MAX) {
-        errno = EMSGSIZE;
-        return -1;
-    }
-    return vector_io(fd, message->msg_iov, message->msg_iovlen, flags, 1);
+    return managed(fd) ? nsendmsg(fd, message, flags) : REAL(sendmsg, fd, message, flags);
 }
 
 ssize_t recvmsg(int fd, struct msghdr *message, int flags)
 {
-    if (!managed(fd))
-        return REAL(recvmsg, fd, message, flags);
-    if (nisdgram(fd))
-        return ndgram_recvmsg(fd, message, flags);
-    if (!message) {
-        errno = EFAULT;
-        return -1;
-    }
-    if (message->msg_iovlen > IOV_MAX) {
-        errno = EMSGSIZE;
-        return -1;
-    }
-    ssize_t result = vector_io(fd, message->msg_iov, message->msg_iovlen, flags, 0);
-    if (result >= 0) {
-        message->msg_flags = 0;
-        message->msg_controllen = 0;
-        if (message->msg_name)
-            ngetpeername(fd, message->msg_name, &message->msg_namelen);
-    }
-    return result;
+    return managed(fd) ? nrecvmsg(fd, message, flags) : REAL(recvmsg, fd, message, flags);
 }
 
 int shutdown(int fd, int how)

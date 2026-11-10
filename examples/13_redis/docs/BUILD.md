@@ -41,7 +41,7 @@ ldd build/libdpdknet.so
 make test
 ```
 
-执行五组测试：拥塞控制；真实 TCP 核心的模拟报文；真实 UDP 核心的数据报测试；自己的 epoll 核心；真实 Linux fd + 测试后端的 LD_PRELOAD 接口。最后一组使用 `build/libhook_test.so`，它不是应用运行时的协议栈库。
+执行六组测试：拥塞控制；真实 TCP 核心的模拟报文；真实 UDP 核心的数据报测试；真实统一 socket API（注册表、操作表、消息、fd 复用、accept 和 fork）；自己的 epoll 核心；真实 Linux fd + 测试后端的 LD_PRELOAD 接口。最后一组使用 `build/libhook_test.so`，它不是应用运行时的协议栈库。
 
 ### 3.1 epoll 核心内存检查
 

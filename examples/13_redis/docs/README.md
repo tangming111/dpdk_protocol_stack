@@ -37,3 +37,7 @@
 ## 文档维护约定
 
 架构与函数说明只维护在 CODE_GUIDE；协议语义与限制在 PROTOCOLS；事件内部机制在 EPOLL；执行命令在 BUILD；测试事实在 VALIDATION；通用 Linux 网络命令与双端点练习在 LINUX_IP_LAB。其它文档通过链接引用，避免复制整段内容导致版本不一致。
+
+- [Socket 协议分派架构](SOCKET_ARCHITECTURE.md)：静态协议注册表、操作表、公共 fd 管理与生命周期。
+
+- [Nginx TCP与QUIC/HTTP3实测](NGINX_QUIC.md)：加载现有so的隔离联调、poll/单进程配置、HTTP/3证据与SIGTERM退出限制。

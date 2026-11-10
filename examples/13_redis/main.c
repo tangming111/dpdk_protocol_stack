@@ -5,6 +5,7 @@
 #include <sys/syscall.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/uio.h>
 #include <netinet/tcp.h>
 #include <time.h>
 #include <arpa/inet.h>
@@ -566,6 +567,7 @@ int udp_out(struct rte_mempool *mbuf_pool)
 
 #include "tcp_core.h"
 #include "udp_core.h"
+#include "socket_api.h"
 
 #define BUFFER_SIZE 1024
 
@@ -617,7 +619,7 @@ static int pkt_process(void *arg)
                        rte_pktmbuf_data_len(packet) >= sizeof(*eth) + sizeof(struct rte_ipv4_hdr)) {
                 struct rte_ipv4_hdr *ipv4_header = (void *)(eth + 1);
                 if (ipv4_header->dst_addr == g_stack_ipv4_addr &&
-                    ipv4_header->version_ihl == 0x45 && tcp_ipv4_valid(ipv4_header)) {
+                    ipv4_header->version_ihl == 0x45 && socket_ipv4_valid(ipv4_header)) {
                     ng_arp_entry_insert(ipv4_header->src_addr, eth->s_addr.addr_bytes);
                     if (ipv4_header->next_proto_id == IPPROTO_TCP) {
                         ng_tcp_process(packet);
@@ -651,17 +653,12 @@ static int pkt_process(void *arg)
 /* Descriptor numbers are reserved with eventfd and tracked by protocol. */
 static int get_fd_frombitmap(void)
 {
-    return tcp_fd_alloc();
+    return socket_fd_alloc(STACK_SOCKET_UDP);
 }
 
 static int set_fd_frombitmap(int fd)
 {
-    return tcp_fd_release(fd);
-}
-
-int netstack_fd_is_managed(int fd)
-{
-    return tcp_fd_managed(fd);
+    return socket_fd_release(fd);
 }
 
 static struct ng_tcp_stream *get_accept_tcb(uint16_t dport)
@@ -715,130 +712,6 @@ struct localhost *get_hostinfo_fromip_port(uint32_t ip, uint16_t port, uint8_t p
     return NULL;
 }
 
-int nsocket(int domain, int type, int protocol)
-{
-    return (type & 15) == SOCK_DGRAM ? udp_socket_create(domain, type, protocol)
-                                     : tcp_socket(domain, type, protocol);
-}
-
-int nbind(int fd, const struct sockaddr *socket_addr, socklen_t address_len)
-{
-    return nisdgram(fd) ? udp_bind(fd, socket_addr, address_len)
-                        : tcp_bind(fd, socket_addr, address_len);
-}
-
-int nlisten(int fd, int backlog)
-{
-    if (nisdgram(fd)) {
-        errno = EOPNOTSUPP;
-        return -1;
-    }
-    return tcp_listen(fd, backlog);
-}
-
-int naccept(int fd, struct sockaddr *socket_addr, socklen_t *address_len)
-{
-    if (nisdgram(fd)) {
-        errno = EOPNOTSUPP;
-        return -1;
-    }
-    return tcp_accept(fd, socket_addr, address_len);
-}
-
-ssize_t nsend(int fd, const void *buffer, size_t buffer_len, int flags)
-{
-    return nisdgram(fd) ? udp_sendto(fd, buffer, buffer_len, flags, NULL, 0)
-                        : tcp_send(fd, buffer, buffer_len, flags);
-}
-
-// recv 32
-// recv
-ssize_t nrecv(int fd, void *buffer, size_t buffer_len, int flags)
-{
-    return nisdgram(fd) ? udp_recvfrom(fd, buffer, buffer_len, flags, NULL, NULL, NULL)
-                        : tcp_recv(fd, buffer, buffer_len, flags);
-}
-
-ssize_t nrecvfrom(int fd, void *buffer, size_t buffer_len, int flags, struct sockaddr *peer_addr,
-                  socklen_t *address_len)
-{
-    if (nisdgram(fd))
-        return udp_recvfrom(fd, buffer, buffer_len, flags, peer_addr, address_len, NULL);
-    if (peer_addr && !address_len) {
-        errno = EFAULT;
-        return -1;
-    }
-    ssize_t result = tcp_recv(fd, buffer, buffer_len, flags);
-    if (result >= 0 && peer_addr && tcp_name(fd, peer_addr, address_len, 1) < 0)
-        return -1;
-    return result;
-}
-
-ssize_t nsendto(int fd, const void *buffer, size_t buffer_len, int flags,
-                const struct sockaddr *peer_addr, socklen_t address_len)
-{
-    if (nisdgram(fd))
-        return udp_sendto(fd, buffer, buffer_len, flags, peer_addr, address_len);
-    if (peer_addr) {
-        errno = EISCONN;
-        return -1;
-    }
-    return tcp_send(fd, buffer, buffer_len, flags);
-}
-
-int nconnect(int fd, const struct sockaddr *socket_addr, socklen_t address_len)
-{
-    return nisdgram(fd) ? udp_connect(fd, socket_addr, address_len)
-                        : tcp_connect(fd, socket_addr, address_len);
-}
-
-int nshutdown(int fd, int how)
-{
-    return nisdgram(fd) ? udp_shutdown(fd, how) : tcp_shutdown(fd, how);
-}
-
-int nfcntl(int fd, int command, long argument)
-{
-    return nisdgram(fd) ? udp_fcntl(fd, command, argument) : tcp_fcntl(fd, command, argument);
-}
-
-int nready(int fd)
-{
-    return nisdgram(fd) ? udp_ready(fd) : tcp_ready(fd);
-}
-
-int nioctl(int fd, unsigned long request, void *argument)
-{
-    return nisdgram(fd) ? udp_ioctl(fd, request, argument) : tcp_ioctl(fd, request, argument);
-}
-
-int nsetsockopt(int fd, int level, int option, const void *value, socklen_t option_len)
-{
-    return nisdgram(fd) ? udp_setsockopt(fd, level, option, value, option_len)
-                        : tcp_setsockopt(fd, level, option, value, option_len);
-}
-
-int ngetsockopt(int fd, int level, int option, void *value, socklen_t *option_len)
-{
-    return nisdgram(fd) ? udp_getsockopt(fd, level, option, value, option_len)
-                        : tcp_getsockopt(fd, level, option, value, option_len);
-}
-
-ssize_t ndgram_sendmsg(int fd, const struct msghdr *message, int flags)
-{
-    return udp_sendmsg(fd, message, flags);
-}
-
-ssize_t ndgram_recvmsg(int fd, struct msghdr *message, int flags)
-{
-    return udp_recvmsg(fd, message, flags);
-}
-
-int nclose(int fd)
-{
-    return nisdgram(fd) ? udp_close(fd) : tcp_close(fd);
-}
-
 /* 判断受管 fd 的类型并回填本地/远端四元组。
  * 注意：不能把 TCP 流强转成 struct localhost* 去读 ->protocol —— ng_tcp_stream 的
  * protocol 是 uint16_t 且后面紧跟 sport，按 int 读会把 sport 混进高位(bind 时
@@ -876,20 +749,6 @@ static int managed_socket_protocol(int fd, uint32_t *local_ip, uint16_t *local_p
     }
 
     return -1;
-}
-
-/* getsockname：返回本地地址。ip/port 在结构体里本就是网络字节序，直接拷贝。 */
-int ngetsockname(int fd, struct sockaddr *socket_addr, socklen_t *address_len)
-{
-    return nisdgram(fd) ? udp_name(fd, socket_addr, address_len, 0)
-                        : tcp_name(fd, socket_addr, address_len, 0);
-}
-
-/* getpeername：返回远端地址。TCP 监听 socket 没有对端，返回 ENOTCONN。 */
-int ngetpeername(int fd, struct sockaddr *socket_addr, socklen_t *address_len)
-{
-    return nisdgram(fd) ? udp_name(fd, socket_addr, address_len, 1)
-                        : tcp_name(fd, socket_addr, address_len, 1);
 }
 
 int udp_server_entry(__attribute__((unused)) void *arg)
@@ -1043,7 +902,6 @@ static uint32_t count_bit(uint8_t *msg, const uint32_t length)
 	uint32_t c, set_bits = 0; // store the total here
 	static const int S[5] = {1, 2, 4, 8, 16}; // Magic Binary Numbers
 	static const int B[5] = {0x55555555, 0x33333333, 0x0F0F0F0F, 0x00FF00FF, 0x0000FFFF};
-
 
 	uint32_t *ptr = (uint32_t *)msg;
 	uint32_t *end = (uint32_t *)msg + length;
@@ -1353,8 +1211,8 @@ void netstack_fini(void)
             tcp_finish(tcp_stream, SHUT_WR);
     }
     pthread_mutex_unlock(&socket_state_lock);
-    uint64_t deadline = tcp_now() + 2000;
-    while (tcp_now() < deadline) {
+    uint64_t deadline = socket_now() + 2000;
+    while (socket_now() < deadline) {
         int has_pending_output = 0;
         pthread_mutex_lock(&socket_state_lock);
         for (tcp_stream = tcp_table.streams; tcp_stream; tcp_stream = tcp_stream->next)

@@ -1,8 +1,7 @@
-/* IPv4 UDP engine. Included after tcp_core.h; both engines share socket_state_lock
- * and the descriptor registry. UDP owns whole datagrams, never byte streams. */
+/* IPv4 UDP engine; shares descriptor management and locking via socket_core.h. */
 #ifndef DPDKNET_UDP_CORE_H
 #define DPDKNET_UDP_CORE_H
-#include <sys/uio.h>
+#include "socket_core.h"
 #define UDP_MAX_PAYLOAD 1472u
 #define UDP_QUEUE_BYTES (1024u * 1024u)
 #define UDP_QUEUE_PACKETS 1024u
@@ -28,10 +27,9 @@ struct udp_socket {
     uint64_t last_arp_request_ms;
 };
 static struct udp_socket *udp_sockets;
-int nisdgram(int fd)
+static void udp_fork_child_reset(void)
 {
-    return fd >= 0 && fd < STACK_MAX_FDS &&
-           __atomic_load_n(&socket_fd_types[fd], __ATOMIC_ACQUIRE) == 2;
+    udp_sockets = NULL;
 }
 
 static struct udp_socket *udp_find(int fd)
@@ -71,11 +69,11 @@ static int udp_socket_create(int domain, int type, int protocol)
         return -1;
     }
     pthread_mutex_lock(&socket_state_lock);
-    int fd = tcp_fd_alloc();
+    int fd = socket_fd_alloc(STACK_SOCKET_UDP);
     if (fd >= 0) {
         struct udp_socket *udp_endpoint = rte_zmalloc("udp_socket", sizeof(*udp_endpoint), 0);
         if (!udp_endpoint) {
-            tcp_fd_release(fd);
+            socket_fd_release(fd);
             fd = -1;
             errno = ENOMEM;
         } else {
@@ -87,7 +85,6 @@ static int udp_socket_create(int domain, int type, int protocol)
             udp_endpoint->path_mtu_discovery = IP_PMTUDISC_DO;
             syscall(SYS_fcntl, fd, F_SETFD, (type & SOCK_CLOEXEC) ? FD_CLOEXEC : 0);
             LL_ADD(udp_endpoint, udp_sockets);
-            __atomic_store_n(&socket_fd_types[fd], 2, __ATOMIC_RELEASE);
         }
     }
     pthread_mutex_unlock(&socket_state_lock);
@@ -227,7 +224,7 @@ static int udp_name(int fd, struct sockaddr *addr, socklen_t *address_len, int p
         errno = ENOTCONN;
     else
         result =
-            tcp_copy_addr(addr, address_len, peer ? udp_endpoint->peer_ip : udp_endpoint->local_ip,
+            socket_copy_addr(addr, address_len, peer ? udp_endpoint->peer_ip : udp_endpoint->local_ip,
                           peer ? udp_endpoint->peer_port : udp_endpoint->local_port);
     pthread_mutex_unlock(&socket_state_lock);
     return result;
@@ -290,7 +287,7 @@ static ssize_t udp_sendto(int fd, const void *buffer, size_t buffer_len, int fla
             datagram->peer_ip = peer_ip;
             datagram->peer_port = peer_port;
             datagram->payload_len = buffer_len;
-            datagram->queued_at_ms = tcp_now();
+            datagram->queued_at_ms = socket_now();
             if (buffer_len)
                 memcpy(datagram->data, buffer, buffer_len);
             if (udp_endpoint->send_tail)
@@ -307,7 +304,7 @@ static ssize_t udp_sendto(int fd, const void *buffer, size_t buffer_len, int fla
             errno = EAGAIN;
             break;
         }
-        tcp_pause();
+        socket_pause();
     }
     pthread_mutex_unlock(&socket_state_lock);
     return result;
@@ -340,7 +337,7 @@ static ssize_t udp_recvfrom(int fd, void *buffer, size_t buffer_len, int flags,
             if (copy)
                 memcpy(buffer, datagram->data, copy);
             if (addr)
-                tcp_copy_addr(addr, address_len, datagram->peer_ip, datagram->peer_port);
+                socket_copy_addr(addr, address_len, datagram->peer_ip, datagram->peer_port);
             if (outflags && buffer_len < datagram->payload_len)
                 *outflags = MSG_TRUNC;
             result = (flags & MSG_TRUNC) ? datagram->payload_len : copy;
@@ -367,7 +364,7 @@ static ssize_t udp_recvfrom(int fd, void *buffer, size_t buffer_len, int flags,
             errno = EAGAIN;
             break;
         }
-        tcp_pause();
+        socket_pause();
     }
     pthread_mutex_unlock(&socket_state_lock);
     return result;
@@ -387,7 +384,7 @@ static int ng_udp_process(struct rte_mbuf *packet)
     if (ipv4_header->version_ihl != 0x45 || ipv4_header->next_proto_id != IPPROTO_UDP ||
         ipv4_packet_len < 28 || ipv4_packet_len > available_bytes - ethernet_header_len ||
         (ntohs(ipv4_header->fragment_offset) & 0x3fff) ||
-        ipv4_header->dst_addr != g_stack_ipv4_addr || !tcp_ipv4_valid(ipv4_header)) {
+        ipv4_header->dst_addr != g_stack_ipv4_addr || !socket_ipv4_valid(ipv4_header)) {
         rte_pktmbuf_free(packet);
         return -1;
     }
@@ -438,7 +435,7 @@ static int ng_udp_process(struct rte_mbuf *packet)
             datagram->peer_ip = ipv4_header->src_addr;
             datagram->peer_port = udp_header->src_port;
             datagram->payload_len = payload_len;
-            datagram->queued_at_ms = tcp_now();
+            datagram->queued_at_ms = socket_now();
             if (payload_len)
                 memcpy(datagram->data, udp_header + 1, payload_len);
             if (matched_endpoint->recv_tail)
@@ -461,7 +458,7 @@ static int udp_emit(struct udp_socket *udp_endpoint, struct udp_datagram *datagr
     uint8_t *peer_mac = ng_get_dst_macaddr(datagram->peer_ip);
     struct inout_ring *ring = ring_instance();
     if (!peer_mac) {
-        uint64_t now_ms = tcp_now();
+        uint64_t now_ms = socket_now();
         if (now_ms - udp_endpoint->last_arp_request_ms >= 1000) {
             struct rte_mbuf *arp_packet =
                 ng_send_arp(packet_pool, RTE_ARP_OP_REQUEST, g_arp_broadcast_mac,
@@ -522,7 +519,7 @@ static void ng_udp_out(struct rte_mempool *packet_pool)
         while (udp_endpoint->send_head && burst--) {
             struct udp_datagram *datagram = udp_endpoint->send_head;
             int expired = !ng_get_dst_macaddr(datagram->peer_ip) &&
-                          tcp_now() - datagram->queued_at_ms >= UDP_ARP_TIMEOUT_MS;
+                          socket_now() - datagram->queued_at_ms >= UDP_ARP_TIMEOUT_MS;
             if (!expired && udp_emit(udp_endpoint, datagram, packet_pool) < 0)
                 break;
             if (expired)
@@ -553,7 +550,7 @@ static int udp_close(int fd)
         udp_free_queue(udp_endpoint->recv_head);
         udp_endpoint->recv_head = udp_endpoint->recv_tail = NULL;
         udp_endpoint->recv_datagram_count = udp_endpoint->recv_queue_bytes = 0;
-        result = tcp_fd_release(fd);
+        result = socket_fd_release(fd);
         if (!udp_endpoint->send_head)
             udp_destroy(udp_endpoint);
     }

@@ -216,7 +216,7 @@ int main(void)
     clear_output();
     input(tcp_stream, 110, tcp_stream->send_next_seq, RTE_TCP_ACK_FLAG, 65535, NULL, 0);
     ng_tcp_out(NULL);
-    assert(!tcp_fd_managed(fd) && tcp_table.streams == NULL);
+    assert(!netstack_fd_is_managed(fd) && tcp_table.streams == NULL);
     /* Passive handshake validates ACK and accept(NULL,NULL) works. */
     int l = tcp_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     peer.sin_addr.s_addr = g_stack_ipv4_addr;

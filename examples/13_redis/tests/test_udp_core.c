@@ -107,7 +107,7 @@ int main(void)
     struct rte_udp_hdr *udp_header = (void *)(ipv4_header + 1);
     assert(ipv4_header->next_proto_id == IPPROTO_UDP &&
            ipv4_header->src_addr == g_stack_ipv4_addr && ipv4_header->dst_addr == peer &&
-           tcp_ipv4_valid(ipv4_header));
+           socket_ipv4_valid(ipv4_header));
     assert(udp_header->src_port == local.sin_port && udp_header->dst_port == remote.sin_port &&
            ntohs(udp_header->dgram_len) == 19 && !memcmp(udp_header + 1, "binary\0data", 11));
     uint16_t saved = udp_header->dgram_cksum;
@@ -185,7 +185,7 @@ int main(void)
            udp_sendto(fd, buf, 1, 0, NULL, 0) == -1 && errno == EDESTADDRREQ);
     /* Close retains queued sends until output accepts them. */
     assert(udp_sendto(fd, "last", 4, 0, (void *)&remote, sizeof(remote)) == 4);
-    assert(udp_close(fd) == 0 && !tcp_fd_managed(fd));
+    assert(udp_close(fd) == 0 && !netstack_fd_is_managed(fd));
     assert(udp_close(listener) == 0);
     int rebound = udp_socket_create(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     assert(udp_bind(rebound, (void *)&local, sizeof(local)) == 0);
